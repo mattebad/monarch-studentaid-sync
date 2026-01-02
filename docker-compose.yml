@@ -1,0 +1,16 @@
+services:
+  studentaid-monarch-sync:
+    build: .
+    image: studentaid-monarch-sync:latest
+    container_name: studentaid-monarch-sync
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./config.yaml:/app/config.yaml:ro
+    # Recommended for Chromium/Playwright stability (avoids /dev/shm issues).
+    shm_size: "1gb"
+    command: ["sync", "--config", "/app/config.yaml"]
+    restart: "no"
+
+

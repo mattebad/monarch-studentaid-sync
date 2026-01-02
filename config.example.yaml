@@ -1,0 +1,44 @@
+servicer:
+  # Provider slug (usually matches the subdomain in `https://{provider}.studentaid.gov`)
+  # Examples: cri, nelnet, mohela, edfinancial, aidvantage
+  provider: "${SERVICER_PROVIDER}"
+  # Optional override if your portal does not match the standard pattern.
+  # If unset/empty, we default to `https://{provider}.studentaid.gov`.
+  base_url: ""
+  username: "${SERVICER_USERNAME}"
+  password: "${SERVICER_PASSWORD}"
+  mfa_method: "email" # email only (automation)
+
+gmail_imap:
+  user: "${GMAIL_IMAP_USER}"
+  app_password: "${GMAIL_IMAP_APP_PASSWORD}"
+  folder: "${GMAIL_IMAP_FOLDER}"
+  sender_hint: "${GMAIL_IMAP_SENDER_HINT}"
+  subject_hint: "${GMAIL_IMAP_SUBJECT_HINT}"
+  # Keep this broad; we'll extract a 6-digit code by regex
+  code_regex: "\\b(\\d{6})\\b"
+
+monarch:
+  email: "${MONARCH_EMAIL}"
+  password: "${MONARCH_PASSWORD}"
+  token: "${MONARCH_TOKEN}"
+  mfa_secret: "${MONARCH_MFA_SECRET}"
+  transfer_category_name: "Transfer"
+  # Merchant name to use for payment transactions (also used by dupe-check: date + amount + merchant)
+  payment_merchant_name: "US Department of Education"
+  session_file: "data/monarch_session.pickle"
+
+state:
+  db_path: "data/state.db"
+
+logging:
+  level: "${LOG_LEVEL}"
+  file_path: "data/sync.log"
+
+# Map loan groups (AA/AB/...) to Monarch account identifiers.
+# Prefer account IDs once you have them (stable). Names are supported too.
+loans:
+  - group: "AA"
+    monarch_account_id: ""
+    monarch_account_name: "Federal-AA"
+

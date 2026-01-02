@@ -1,0 +1,15 @@
+playwright==1.49.0
+PyYAML==6.0.2
+pydantic==2.10.3
+python-dotenv==1.0.1
+python-dateutil==2.9.0.post0
+tenacity==9.0.0
+requests==2.32.3
+
+# Monarch API client (unofficial)
+git+https://github.com/hammem/monarchmoney.git
+
+# Tests (fast, no secrets)
+pytest==8.3.4
+
+
