@@ -5,7 +5,7 @@ import os
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import date, timedelta
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 
 from monarchmoney import MonarchMoney
 
@@ -60,8 +60,10 @@ class MonarchClient:
         self._mm = MonarchMoney(session_file=session_file, token=self._token or None)
 
         self._accounts_cache: Optional[List[Dict[str, Any]]] = None
+        self._account_type_options_cache: Optional[List[Dict[str, Any]]] = None
         self._category_cache: Optional[List[Dict[str, Any]]] = None
         self._transactions_cache: dict[tuple[str, str, str, int, int, str], List[Dict[str, Any]]] = {}
+        self._student_loan_type_subtype: Optional[Tuple[str, str]] = None
 
     async def login(self) -> None:
         # Ensure the session directory exists (important for commands like list-monarch-accounts).
@@ -105,6 +107,92 @@ class MonarchClient:
             resp = await self._mm.get_transaction_categories()
             self._category_cache = resp.get("categories", [])
         return list(self._category_cache)
+
+    async def list_account_type_options(self) -> List[Dict[str, Any]]:
+        if self._account_type_options_cache is None:
+            resp = await self._mm.get_account_type_options()
+            self._account_type_options_cache = resp.get("accountTypeOptions", []) or []
+        return list(self._account_type_options_cache)
+
+    async def _pick_student_loan_type_subtype(self) -> Tuple[str, str]:
+        """
+        Choose a reasonable (type, subtype) for a manual student loan account.
+
+        Monarch's schema varies a bit over time; we pick the best match from `accountTypeOptions`.
+        """
+        if self._student_loan_type_subtype is not None:
+            return self._student_loan_type_subtype
+
+        opts = await self.list_account_type_options()
+        best: Optional[Tuple[int, str, str]] = None
+
+        for o in opts:
+            t = o.get("type") or {}
+            st = o.get("subtype") or {}
+            t_name = str(t.get("name") or "")
+            t_disp = str(t.get("display") or "")
+            st_name = str(st.get("name") or "")
+            st_disp = str(st.get("display") or "")
+
+            score = 0
+            if t_name.lower() == "loan" or "loan" in t_disp.lower():
+                score += 10
+            if "student" in st_name.lower() or "student" in st_disp.lower():
+                score += 5
+            if "loan" in st_name.lower() or "loan" in st_disp.lower():
+                score += 1
+
+            if not t_name or not st_name:
+                continue
+
+            cand = (score, t_name, st_name)
+            if best is None or cand[0] > best[0]:
+                best = cand
+
+        if best is None:
+            raise RuntimeError(
+                "Could not determine a manual account type/subtype for student loans from Monarch. "
+                "Try updating the 'monarchmoney' dependency or create the manual accounts in Monarch and map by name/ID."
+            )
+
+        _, t_name, st_name = best
+        self._student_loan_type_subtype = (t_name, st_name)
+        return self._student_loan_type_subtype
+
+    async def create_student_loan_manual_account(
+        self,
+        *,
+        account_name: str,
+        include_in_net_worth: bool = True,
+        starting_balance_cents: int = 0,
+    ) -> str:
+        """
+        Create a new manual student loan account and return its account id.
+        """
+        account_type, account_sub_type = await self._pick_student_loan_type_subtype()
+        bal = _cents_to_dollars(starting_balance_cents)
+
+        resp = await self._mm.create_manual_account(
+            account_type=account_type,
+            account_sub_type=account_sub_type,
+            is_in_net_worth=bool(include_in_net_worth),
+            account_name=str(account_name),
+            account_balance=float(bal),
+        )
+
+        payload = (resp.get("createManualAccount") or {})
+        errors = payload.get("errors") or []
+        if errors:
+            raise RuntimeError(f"Monarch create_manual_account failed: {errors}")
+
+        acct = payload.get("account") or {}
+        acct_id = str(acct.get("id") or "").strip()
+        if not acct_id:
+            raise RuntimeError(f"Monarch create_manual_account returned no account id: {resp}")
+
+        # Bust caches so future calls see the new account.
+        self._accounts_cache = None
+        return acct_id
 
     async def resolve_account_id(self, *, account_id: str, account_name: str) -> str:
         if account_id:

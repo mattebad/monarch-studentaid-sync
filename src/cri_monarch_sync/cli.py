@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import logging
 import os
+import sys
 from pathlib import Path
 from typing import List, Optional
 
@@ -14,6 +15,18 @@ from .cri.mfa import poll_gmail_imap_for_code
 from .config import load_config
 from .logging_config import configure_logging
 from .monarch.client import MonarchClient
+from .monarch.loan_accounts import (
+    DEFAULT_LOAN_ACCOUNT_NAME_TEMPLATE,
+    LoanAccountMapping,
+    candidate_loan_account_names,
+    default_mapping_path,
+    find_exact_name_matches,
+    load_loan_account_mapping,
+    name_contains_group_token,
+    normalize_group,
+    render_loan_account_name,
+    save_loan_account_mapping,
+)
 from .servicers import KNOWN_SERVICERS, is_known_provider
 from .state import StateStore
 from .util.debug_bundle import create_debug_bundle
@@ -76,9 +89,49 @@ def _build_parser() -> argparse.ArgumentParser:
         default="",
         help="Only create payment transactions for payments on/after this date (YYYY-MM-DD).",
     )
+    sync.add_argument(
+        "--auto-setup-accounts",
+        action="store_true",
+        help="If loan groups are not mapped to Monarch account IDs yet, attempt to auto-map (and optionally create) manual accounts and persist the mapping under data/.",
+    )
 
     list_accounts = sub.add_parser("list-monarch-accounts", help="List Monarch accounts (for mapping setup)")
     list_accounts.add_argument("--config", default="config.yaml", help="Path to YAML config (default: config.yaml)")
+
+    setup_accounts = sub.add_parser(
+        "setup-monarch-accounts",
+        help="Map (and optionally create) Monarch manual accounts for your loan groups, so you never have to copy/paste account IDs.",
+    )
+    setup_accounts.add_argument("--config", default="config.yaml", help="Path to YAML config (default: config.yaml)")
+    setup_accounts.add_argument(
+        "--name-template",
+        default="",
+        help=(
+            "Account naming template when creating new manual accounts. "
+            "Placeholders: {provider}, {provider_upper}, {provider_display}, {group}. "
+            "Default: monarch.loan_account_name_template (or '{provider}-{group}')."
+        ),
+    )
+    setup_accounts.add_argument(
+        "--apply",
+        action="store_true",
+        help="Actually create missing accounts and write the mapping file. Without this flag, prints what it would do.",
+    )
+    setup_accounts.add_argument(
+        "--yes",
+        action="store_true",
+        help="Non-interactive: accept best guesses and create missing accounts without prompting.",
+    )
+    setup_accounts.add_argument(
+        "--no-create",
+        action="store_true",
+        help="Do not create any new manual accounts (only map existing).",
+    )
+    setup_accounts.add_argument(
+        "--out",
+        default="",
+        help="Optional output path for the mapping JSON (default: data/monarch_loan_accounts_{provider}.json)",
+    )
 
     list_servicers = sub.add_parser(
         "list-servicers",
@@ -134,14 +187,20 @@ def main(argv: Optional[List[str]] = None) -> int:
 
             groups = [m.group for m in cfg.loans]
             if not groups:
-                raise SystemExit("No loans configured. Add loan groups to config.yaml under 'loans:'")
+                raise SystemExit("No loans configured. Set LOAN_GROUPS in .env (recommended), or add loan groups under 'loans:' in a YAML config.")
+
+            if args.auto_setup_accounts and args.dry_run:
+                raise SystemExit(
+                    "--auto-setup-accounts may create Monarch manual accounts and is not allowed with --dry-run. "
+                    "Run `studentaid_monarch_sync setup-monarch-accounts --apply` first, then run sync."
+                )
 
             # Fail fast: validate Monarch auth before we spend time in Playwright.
             # - For real runs we *must* talk to Monarch, so validate now.
             # - For dry-run-check-monarch we also talk to Monarch, so validate now.
             needs_monarch = (not args.dry_run) or bool(args.dry_run_check_monarch)
             if needs_monarch and not args.skip_monarch_preflight:
-                asyncio.run(_preflight_monarch(cfg))
+                asyncio.run(_preflight_monarch(cfg, check_mappings=not bool(args.auto_setup_accounts)))
 
             cutoff = None
             if args.payments_since:
@@ -207,7 +266,15 @@ def main(argv: Optional[List[str]] = None) -> int:
                     state.record_run_finish(run_id, ok=True, message="dry-run")
                     return 0
 
-                asyncio.run(_apply_monarch_updates(cfg, state, loan_snapshots, payment_allocations))
+                asyncio.run(
+                    _apply_monarch_updates(
+                        cfg,
+                        state,
+                        loan_snapshots,
+                        payment_allocations,
+                        auto_setup_accounts=bool(args.auto_setup_accounts),
+                    )
+                )
                 state.record_run_finish(run_id, ok=True)
                 return 0
             except Exception as e:
@@ -235,6 +302,21 @@ def main(argv: Optional[List[str]] = None) -> int:
         asyncio.run(_list_monarch_accounts(cfg))
         return 0
 
+    if args.cmd == "setup-monarch-accounts":
+        cfg = load_config(args.config)
+        configure_logging(level=cfg.logging.level, file_path=cfg.logging.file_path)
+        asyncio.run(
+            _setup_monarch_accounts(
+                cfg,
+                apply=args.apply,
+                yes=args.yes,
+                no_create=args.no_create,
+                name_template=args.name_template,
+                out_path=args.out,
+            )
+        )
+        return 0
+
     if args.cmd == "list-servicers":
         # Print only; no config/env required.
         for k in sorted(KNOWN_SERVICERS.keys()):
@@ -245,7 +327,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     raise AssertionError("Unhandled command")
 
 
-async def _preflight_monarch(cfg) -> None:
+async def _preflight_monarch(cfg, *, check_mappings: bool = True) -> None:
     """
     Validate Monarch auth and basic config mapping without mutating anything.
 
@@ -265,16 +347,22 @@ async def _preflight_monarch(cfg) -> None:
         accounts = await mc.list_accounts()  # forces an authenticated API call
         _ = await mc.get_category_id_by_name(cfg.monarch.transfer_category_name)
 
-        # Ensure loan mappings resolve (fast: uses cached account list).
-        for m in cfg.loans:
-            await mc.resolve_account_id(account_id=m.monarch_account_id, account_name=m.monarch_account_name)
+        # Ensure loan groups map to Monarch accounts (no writes in preflight).
+        if check_mappings:
+            _ = await _resolve_monarch_loan_group_accounts(
+                cfg,
+                mc,
+                allow_create=False,
+                yes=False,
+                interactive=False,
+            )
 
         logger.info("Monarch preflight OK (accounts=%d, transfer_category=%r)", len(accounts), cfg.monarch.transfer_category_name)
     except Exception as e:
         raise RuntimeError(
             "Monarch preflight failed. This often means your MONARCH_TOKEN/session is invalid/expired, "
-            "or your loan account mappings are wrong. Fix Monarch auth (or delete data/monarch_session.pickle) "
-            "before running sync."
+            "or your loan account mappings are missing/wrong. Fix Monarch auth (or delete data/monarch_session.pickle), "
+            "then run `studentaid_monarch_sync setup-monarch-accounts --apply` to auto-create/map accounts."
         ) from e
 
 
@@ -360,12 +448,14 @@ async def _log_dry_run_with_monarch(cfg, state: StateStore, loan_snapshots, paym
     transfer_category_id = await mc.get_category_id_by_name(cfg.monarch.transfer_category_name)
     _ = transfer_category_id  # appease linters; dry-run never writes
 
-    # Map group -> monarch account id
-    group_to_account_id: dict[str, str] = {}
-    for m in cfg.loans:
-        group_to_account_id[m.group] = await mc.resolve_account_id(
-            account_id=m.monarch_account_id, account_name=m.monarch_account_name
-        )
+    # Map group -> monarch account id (read-only; never creates accounts in dry-run-check-monarch).
+    group_to_account_id = await _resolve_monarch_loan_group_accounts(
+        cfg,
+        mc,
+        allow_create=False,
+        yes=False,
+        interactive=False,
+    )
 
     # Reference: show the most recent transaction for each loan-group account so we can confirm
     # merchant naming + amount sign conventions.
@@ -483,7 +573,293 @@ async def _list_monarch_accounts(cfg) -> None:
         )
 
 
-async def _apply_monarch_updates(cfg, state: StateStore, loan_snapshots, payment_allocations) -> None:
+def _servicer_display_name(provider: str) -> str:
+    info = KNOWN_SERVICERS.get((provider or "").strip().lower())
+    return info.display_name if info else (provider or "").strip()
+
+
+def _prompt_choice(prompt: str, *, min_value: int, max_value: int) -> int:
+    while True:
+        raw = input(prompt).strip()
+        if not raw:
+            continue
+        if raw.lower() in {"q", "quit", "exit"}:
+            raise SystemExit("Aborted.")
+        if raw.isdigit():
+            n = int(raw)
+            if min_value <= n <= max_value:
+                return n
+        print(f"Enter a number from {min_value} to {max_value} (or 'q' to abort).")
+
+
+async def _resolve_monarch_loan_group_accounts(
+    cfg,
+    mc: MonarchClient,
+    *,
+    allow_create: bool,
+    yes: bool,
+    interactive: bool,
+    name_template_override: str = "",
+    mapping_path_override: str = "",
+) -> dict[str, str]:
+    """
+    Resolve loan group -> Monarch account id using:
+    1) config monarch_account_id (stable)
+    2) mapping file under data/ (stable, rename-safe)
+    3) config monarch_account_name (fallback)
+    4) derived name template + heuristics (first-time setup convenience)
+
+    If allow_create=True, missing groups can be created as new Monarch manual accounts.
+    """
+    provider = (cfg.servicer.provider or "servicer").strip().lower()
+    provider_display = _servicer_display_name(provider) or provider
+
+    template = (name_template_override or cfg.monarch.loan_account_name_template or DEFAULT_LOAN_ACCOUNT_NAME_TEMPLATE).strip()
+    if not template:
+        template = DEFAULT_LOAN_ACCOUNT_NAME_TEMPLATE
+
+    mapping_path = Path(mapping_path_override) if mapping_path_override else default_mapping_path(provider)
+    mapping = load_loan_account_mapping(mapping_path)
+
+    accounts = await mc.list_accounts()
+    account_by_id: dict[str, dict] = {str(a.get("id")): a for a in accounts if a.get("id")}
+    manual_accounts = [a for a in accounts if a.get("isManual")]
+
+    changed = False
+    group_to_account_id: dict[str, str] = {}
+    missing: list[str] = []
+
+    async def _refresh_accounts() -> None:
+        nonlocal accounts, account_by_id, manual_accounts
+        accounts = await mc.list_accounts()
+        account_by_id = {str(a.get("id")): a for a in accounts if a.get("id")}
+        manual_accounts = [a for a in accounts if a.get("isManual")]
+
+    for loan in cfg.loans:
+        group = normalize_group(loan.group)
+        if not group:
+            continue
+
+        acct_id = ""
+
+        # 1) explicit config ID
+        if loan.monarch_account_id:
+            acct_id = str(loan.monarch_account_id).strip()
+
+        # 2) mapping file
+        if not acct_id and group in mapping:
+            acct_id = mapping[group].account_id
+
+        # 3) explicit config name
+        if not acct_id and loan.monarch_account_name:
+            acct_id = await mc.resolve_account_id(account_id="", account_name=loan.monarch_account_name)
+
+        # 4) name template + heuristics
+        if not acct_id:
+            wanted_names = candidate_loan_account_names(
+                template=template,
+                group=group,
+                provider=provider,
+                provider_display=provider_display,
+            )
+
+            exact = find_exact_name_matches(manual_accounts, wanted_names)
+            if len(exact) == 1:
+                acct_id = str(exact[0].get("id") or "").strip()
+            elif len(exact) > 1:
+                if yes:
+                    acct_id = str(exact[0].get("id") or "").strip()
+                    logger.warning(
+                        "Multiple Monarch manual accounts matched group=%s by name; choosing the first match (%s).",
+                        group,
+                        str(exact[0].get("displayName") or ""),
+                    )
+                elif interactive and sys.stdin.isatty():
+                    print(f"\nMultiple Monarch accounts match group={group}. Pick one:")
+                    for i, a in enumerate(exact, start=1):
+                        print(f"  {i}) {a.get('displayName')} (id={a.get('id')})")
+                    choice = _prompt_choice("Choice: ", min_value=1, max_value=len(exact))
+                    acct_id = str(exact[choice - 1].get("id") or "").strip()
+                else:
+                    raise RuntimeError(
+                        f"Multiple Monarch manual accounts matched group={group!r}. "
+                        "Run `studentaid_monarch_sync setup-monarch-accounts` to choose the correct account."
+                    )
+            else:
+                token_matches = [
+                    a for a in manual_accounts if name_contains_group_token(str(a.get("displayName") or ""), group=group)
+                ]
+                if len(token_matches) == 1:
+                    acct_id = str(token_matches[0].get("id") or "").strip()
+                    logger.info(
+                        "Auto-mapped group=%s to Monarch manual account by token match: %s",
+                        group,
+                        str(token_matches[0].get("displayName") or ""),
+                    )
+                elif len(token_matches) > 1:
+                    if yes:
+                        acct_id = str(token_matches[0].get("id") or "").strip()
+                        logger.warning(
+                            "Multiple Monarch manual accounts contained group token %s; choosing the first (%s).",
+                            group,
+                            str(token_matches[0].get("displayName") or ""),
+                        )
+                    elif interactive and sys.stdin.isatty():
+                        print(f"\nMultiple Monarch accounts contain group token {group}. Pick one:")
+                        for i, a in enumerate(token_matches, start=1):
+                            print(f"  {i}) {a.get('displayName')} (id={a.get('id')})")
+                        choice = _prompt_choice("Choice: ", min_value=1, max_value=len(token_matches))
+                        acct_id = str(token_matches[choice - 1].get("id") or "").strip()
+                    else:
+                        raise RuntimeError(
+                            f"Multiple Monarch manual accounts contain group token {group!r}. "
+                            "Run `studentaid_monarch_sync setup-monarch-accounts` to choose the correct account."
+                        )
+
+        # Still missing? Create (if allowed) or fail.
+        if not acct_id:
+            if allow_create:
+                acct_name = render_loan_account_name(
+                    template,
+                    group=group,
+                    provider=provider,
+                    provider_display=provider_display,
+                )
+                if interactive and sys.stdin.isatty() and not yes:
+                    resp = input(f"Create a new Monarch manual account named '{acct_name}' for group {group}? [Y/n] ").strip()
+                    if resp.lower().startswith("n"):
+                        missing.append(group)
+                        continue
+
+                acct_id = await mc.create_student_loan_manual_account(account_name=acct_name, include_in_net_worth=True)
+                await _refresh_accounts()
+                logger.info("Created Monarch manual account for group=%s: %s (id=%s)", group, acct_name, acct_id)
+            else:
+                missing.append(group)
+                continue
+
+        # Validate that the account exists in Monarch (and refresh once if needed).
+        if acct_id not in account_by_id:
+            await _refresh_accounts()
+        if acct_id not in account_by_id:
+            raise RuntimeError(f"Monarch account id not found (group={group}): {acct_id}")
+
+        group_to_account_id[group] = acct_id
+
+        # Update mapping file with stable ID + current displayName (rename-safe).
+        dn = str((account_by_id.get(acct_id) or {}).get("displayName") or "").strip()
+        prev = mapping.get(group)
+        if (prev is None) or (prev.account_id != acct_id) or (dn and prev.account_name != dn):
+            mapping[group] = LoanAccountMapping(account_id=acct_id, account_name=dn)
+            changed = True
+
+    if missing:
+        raise RuntimeError(
+            "Missing Monarch account mappings for loan groups: "
+            + ", ".join(missing)
+            + ". Run `studentaid_monarch_sync setup-monarch-accounts --apply` to auto-create/map accounts, "
+            "or create the manual accounts in Monarch and use a naming template like 'Federal-{group}'."
+        )
+
+    if changed:
+        save_loan_account_mapping(mapping_path, provider=provider, name_template=template, groups=mapping)
+        logger.info("Wrote Monarch loan-account mapping: %s", mapping_path)
+
+    return group_to_account_id
+
+
+async def _setup_monarch_accounts(
+    cfg,
+    *,
+    apply: bool,
+    yes: bool,
+    no_create: bool,
+    name_template: str,
+    out_path: str,
+) -> None:
+    """
+    Interactive-ish setup command to map loan groups to Monarch manual accounts, optionally creating them.
+    """
+    groups = [normalize_group(m.group) for m in cfg.loans if normalize_group(m.group)]
+    if not groups:
+        raise SystemExit("No loans configured. Add loan groups to config.yaml under 'loans:'")
+
+    provider = (cfg.servicer.provider or "servicer").strip().lower()
+    mapping_path = Path(out_path) if out_path else default_mapping_path(provider)
+
+    template = (name_template or cfg.monarch.loan_account_name_template or DEFAULT_LOAN_ACCOUNT_NAME_TEMPLATE).strip()
+    if not template:
+        template = DEFAULT_LOAN_ACCOUNT_NAME_TEMPLATE
+
+    mc = MonarchClient(
+        email=cfg.monarch.email,
+        password=cfg.monarch.password,
+        token=cfg.monarch.token,
+        mfa_secret=cfg.monarch.mfa_secret,
+        session_file=cfg.monarch.session_file,
+    )
+    await mc.login()
+
+    if not apply:
+        # Preview mode: show what we'd do, but don't create anything.
+        accounts = await mc.list_accounts()
+        manual_accounts = [a for a in accounts if a.get("isManual")]
+        provider_display = _servicer_display_name(provider) or provider
+        existing = load_loan_account_mapping(mapping_path)
+
+        print(f"Mapping preview (provider={provider!r}) → {mapping_path}")
+        print("Loan groups:", ", ".join(groups))
+        print()
+
+        for g in groups:
+            if g in existing:
+                print(f"- {g}: mapped (id={existing[g].account_id}, name={existing[g].account_name!r})")
+                continue
+
+            wanted = candidate_loan_account_names(
+                template=template, group=g, provider=provider, provider_display=provider_display
+            )
+            exact = find_exact_name_matches(manual_accounts, wanted)
+            if len(exact) == 1:
+                print(f"- {g}: would map to existing account {exact[0].get('displayName')!r} (id={exact[0].get('id')})")
+                continue
+            if len(exact) > 1:
+                print(f"- {g}: multiple matches; run with --apply (interactive) to choose")
+                continue
+
+            create_name = render_loan_account_name(template, group=g, provider=provider, provider_display=provider_display)
+            if no_create:
+                print(f"- {g}: no match; would FAIL (creation disabled). Expected name like {create_name!r}")
+            else:
+                print(f"- {g}: no match; would create new manual account named {create_name!r}")
+
+        print()
+        print("To apply (create/map + write mapping file):")
+        print(f"  studentaid_monarch_sync setup-monarch-accounts --apply --out {mapping_path}")
+        return
+
+    # Apply mode: map accounts, optionally creating them.
+    _ = await _resolve_monarch_loan_group_accounts(
+        cfg,
+        mc,
+        allow_create=not no_create,
+        yes=yes,
+        interactive=not yes,
+        name_template_override=template,
+        mapping_path_override=str(mapping_path),
+    )
+
+    print(f"✅ Monarch loan accounts mapped. Mapping file: {mapping_path}")
+
+
+async def _apply_monarch_updates(
+    cfg,
+    state: StateStore,
+    loan_snapshots,
+    payment_allocations,
+    *,
+    auto_setup_accounts: bool = False,
+) -> None:
     from datetime import date as _date
 
     mc = MonarchClient(
@@ -498,11 +874,13 @@ async def _apply_monarch_updates(cfg, state: StateStore, loan_snapshots, payment
     transfer_category_id = await mc.get_category_id_by_name(cfg.monarch.transfer_category_name)
 
     # Map group -> monarch account id
-    group_to_account_id: dict[str, str] = {}
-    for m in cfg.loans:
-        group_to_account_id[m.group] = await mc.resolve_account_id(
-            account_id=m.monarch_account_id, account_name=m.monarch_account_name
-        )
+    group_to_account_id = await _resolve_monarch_loan_group_accounts(
+        cfg,
+        mc,
+        allow_create=bool(auto_setup_accounts or getattr(cfg.monarch, "auto_create_loan_accounts", False)),
+        yes=False,
+        interactive=False,
+    )
 
     # Reference: show the most recent transaction for each loan-group account so we can confirm
     # merchant naming + amount sign conventions.

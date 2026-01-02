@@ -9,6 +9,10 @@ servicer:
   password: "${SERVICER_PASSWORD}"
   mfa_method: "email" # email only (automation)
 
+# NOTE:
+# Most users should not need to edit this YAML file at all.
+# Fill out `.env` (including LOAN_GROUPS) and run the CLI.
+
 gmail_imap:
   user: "${GMAIL_IMAP_USER}"
   app_password: "${GMAIL_IMAP_APP_PASSWORD}"
@@ -27,6 +31,15 @@ monarch:
   # Merchant name to use for payment transactions (also used by dupe-check: date + amount + merchant)
   payment_merchant_name: "US Department of Education"
   session_file: "data/monarch_session.pickle"
+  # Optional: naming scheme for loan-group manual accounts (used for auto-mapping / auto-creation).
+  # Placeholders: {provider}, {provider_upper}, {provider_display}, {group}
+  # Examples:
+  #   "{provider}-{group}"        -> "nelnet-AA"
+  #   "Federal-{group}"           -> "Federal-AA"
+  #   "Student Loan-{group}"      -> "Student Loan-AA"
+  loan_account_name_template: "{provider}-{group}"
+  # If true, sync can create missing manual accounts (recommended to instead run setup-monarch-accounts once).
+  auto_create_loan_accounts: false
 
 state:
   db_path: "data/state.db"
@@ -35,10 +48,11 @@ logging:
   level: "${LOG_LEVEL}"
   file_path: "data/sync.log"
 
-# Map loan groups (AA/AB/...) to Monarch account identifiers.
-# Prefer account IDs once you have them (stable). Names are supported too.
-loans:
-  - group: "AA"
-    monarch_account_id: ""
-    monarch_account_name: "Federal-AA"
+# Loan groups are configured via `.env` (recommended):
+#   LOAN_GROUPS=AA,AB,AC
+#
+# Advanced override: you *can* list groups here, but most users shouldn't need to:
+# loans:
+#   - group: "AA"
+#   - group: "AB"
 

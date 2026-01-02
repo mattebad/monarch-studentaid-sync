@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import json
 from pathlib import Path
 from typing import Literal
 from typing import Union
@@ -13,6 +14,7 @@ from pydantic import BaseModel, Field, model_validator
 
 _ENV_VAR_PATTERN = re.compile(r"\$\{([A-Z0-9_]+)\}")
 _PROVIDER_SLUG_RE = re.compile(r"^[a-z0-9-]+$")
+_LOAN_GROUP_RE = re.compile(r"^[A-Z0-9]{2,8}$")
 
 
 def _expand_env_vars(value: object) -> object:
@@ -38,6 +40,103 @@ def _derive_provider_from_base_url(base_url: str) -> str:
     if "." in host:
         return host.split(".", 1)[0]
     return host
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = (os.getenv(name, "") or "").strip().lower()
+    if not raw:
+        return bool(default)
+    return raw in {"1", "true", "t", "yes", "y", "on"}
+
+
+def _deep_merge(base: object, override: object) -> object:
+    if isinstance(base, dict) and isinstance(override, dict):
+        out = dict(base)
+        for k, v in override.items():
+            if k in out:
+                out[k] = _deep_merge(out[k], v)
+            else:
+                out[k] = v
+        return out
+    return override
+
+
+def _parse_loan_groups_env(value: str) -> list[str]:
+    s = (value or "").strip()
+    if not s:
+        return []
+
+    # Support JSON list syntax for power users: ["AA","AB"]
+    if s.startswith("["):
+        try:
+            data = json.loads(s)
+            if isinstance(data, list):
+                items = [str(x) for x in data]
+            else:
+                items = [s]
+        except Exception:
+            items = [s]
+    else:
+        # Comma and/or whitespace separated
+        items = re.split(r"[,\s]+", s)
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        g = (item or "").strip().upper()
+        if not g:
+            continue
+        if not _LOAN_GROUP_RE.match(g):
+            # Keep it permissive but predictable: skip junk tokens rather than crashing.
+            continue
+        if g in seen:
+            continue
+        out.append(g)
+        seen.add(g)
+    return out
+
+
+def _default_config_from_env() -> dict:
+    """
+    Provide a sensible env-only config so most users only need `.env`.
+
+    This is intentionally redundant with `config.example.yaml`; YAML remains an optional advanced override.
+    """
+    return {
+        "servicer": {
+            "provider": os.getenv("SERVICER_PROVIDER", ""),
+            "base_url": os.getenv("SERVICER_BASE_URL", ""),
+            "username": os.getenv("SERVICER_USERNAME", ""),
+            "password": os.getenv("SERVICER_PASSWORD", ""),
+            "mfa_method": os.getenv("SERVICER_MFA_METHOD", "email"),
+        },
+        "gmail_imap": {
+            "user": os.getenv("GMAIL_IMAP_USER", ""),
+            "app_password": os.getenv("GMAIL_IMAP_APP_PASSWORD", ""),
+            "folder": os.getenv("GMAIL_IMAP_FOLDER", "INBOX"),
+            "sender_hint": os.getenv("GMAIL_IMAP_SENDER_HINT", ""),
+            "subject_hint": os.getenv("GMAIL_IMAP_SUBJECT_HINT", ""),
+            "code_regex": os.getenv("GMAIL_IMAP_CODE_REGEX", r"\b(\d{6})\b"),
+        },
+        "monarch": {
+            "email": os.getenv("MONARCH_EMAIL", ""),
+            "password": os.getenv("MONARCH_PASSWORD", ""),
+            "token": os.getenv("MONARCH_TOKEN", ""),
+            "mfa_secret": os.getenv("MONARCH_MFA_SECRET", ""),
+            "transfer_category_name": os.getenv("MONARCH_TRANSFER_CATEGORY_NAME", "Transfer"),
+            "payment_merchant_name": os.getenv("MONARCH_PAYMENT_MERCHANT_NAME", "Student Loan Payment"),
+            "session_file": os.getenv("MONARCH_SESSION_FILE", "data/monarch_session.pickle"),
+            "loan_account_name_template": os.getenv("MONARCH_LOAN_ACCOUNT_NAME_TEMPLATE", "{provider}-{group}"),
+            "auto_create_loan_accounts": _env_bool("MONARCH_AUTO_CREATE_LOAN_ACCOUNTS", default=False),
+        },
+        "state": {
+            "db_path": os.getenv("STATE_DB_PATH", "data/state.db"),
+        },
+        "logging": {
+            "level": os.getenv("LOG_LEVEL", "INFO"),
+            "file_path": os.getenv("LOG_FILE", "data/sync.log"),
+        },
+    }
 
 
 class ServicerConfig(BaseModel):
@@ -105,6 +204,14 @@ class MonarchConfig(BaseModel):
     payment_merchant_name: str = "Student Loan Payment"
     session_file: str = "data/monarch_session.pickle"
 
+    # Loan-group account setup / naming (used for auto-mapping + optional auto-creation).
+    # Placeholders: {provider}, {provider_upper}, {provider_display}, {group}
+    loan_account_name_template: str = "{provider}-{group}"
+
+    # If enabled, `sync --auto-setup-accounts` (or future automation) can create missing manual accounts.
+    # We keep this default False to avoid surprising writes to Monarch without explicit intent.
+    auto_create_loan_accounts: bool = False
+
     @model_validator(mode="after")
     def _validate_auth(self) -> "MonarchConfig":
         if self.token:
@@ -159,8 +266,28 @@ class AppConfig(BaseModel):
 
 def load_config(path: Union[str, Path]) -> AppConfig:
     p = Path(path)
-    raw = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
-    expanded = _expand_env_vars(raw)
-    return AppConfig.model_validate(expanded)
+    raw: dict = {}
+    if p.exists():
+        raw = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+        raw = _expand_env_vars(raw)  # supports ${ENV_VAR} in YAML
+
+    # Apply legacy migrations BEFORE merging in env defaults, so the presence of default keys
+    # doesn't prevent the migration logic from running.
+    if isinstance(raw, dict) and "servicer" not in raw and "cri" in raw and isinstance(raw.get("cri"), dict):
+        legacy = dict(raw["cri"])
+        legacy.setdefault("provider", "cri")
+        raw = dict(raw)
+        raw["servicer"] = legacy
+
+    merged = _deep_merge(_default_config_from_env(), raw)
+    cfg = AppConfig.model_validate(merged)
+
+    # Convenience: allow loan groups to be provided via environment (so most users only edit `.env`).
+    if not cfg.loans:
+        env_groups = _parse_loan_groups_env(os.getenv("LOAN_GROUPS", ""))
+        if env_groups:
+            cfg = cfg.model_copy(update={"loans": [LoanMapping(group=g) for g in env_groups]})
+
+    return cfg
 
 

@@ -6,8 +6,20 @@ This project automates (so you don’t have to click through portals every day):
 
 It’s designed to run **unattended** (Docker/Unraid), with **email MFA** handled via **Gmail IMAP + App Password**. 🤖📬
 
+Shoutout to the maintainers of the unofficial **Monarch Money Python library** — their work made the Monarch-side integration possible. 🙌
+
 ### Quick start (most users) 🚀
 This guide is linear: **Prereqs → Configure → Choose a runtime (Python or Docker) → Preflight → Dry-run → Run**.
+
+### What happens on a run? (end-to-end) 🧠➡️🏦
+At a high level, each scheduled run:
+- Logs into your StudentAid servicer portal with Playwright 🔐
+- Handles MFA via email (Gmail IMAP) when prompted 📬
+- Scrapes current **balances** per loan group (AA/AB/…) and recent **payment allocations**
+- Updates Monarch:
+  - **Balances**: updates your mapped manual accounts
+  - **Payments**: creates transactions (one per allocation) ✅
+- Records a small local history DB (`data/state.db`) so it won’t duplicate payments across runs 🧾
 
 #### Prereqs (set these up once) ✅
 - **Monarch auth** (choose one):
@@ -18,10 +30,18 @@ This guide is linear: **Prereqs → Configure → Choose a runtime (Python or Do
   - If you want the step-by-step Gmail label/filter setup (recommended), see [Gmail IMAP setup](#gmail-imap-setup) 🏷️
 
 #### Configure 🛠️
-1. Copy `env.example` → `.env` and fill in values (Monarch + Gmail IMAP).
-2. Copy `config.example.yaml` → `config.yaml`, then:
-   - Set `servicer.provider` (e.g. `cri`, `nelnet`, `mohela`)
-   - Map your **loan groups** to your Monarch **manual accounts**
+Copy `env.example` → `.env` and fill in values (Monarch + Gmail IMAP + your loan groups).
+
+✅ For most users, **`.env` is the only file you need to edit**.
+
+Required:
+- `SERVICER_PROVIDER`, `SERVICER_USERNAME`, `SERVICER_PASSWORD`
+- `LOAN_GROUPS` (comma-separated: `AA,AB,...`)
+- Monarch auth (`MONARCH_TOKEN` or `MONARCH_EMAIL` + `MONARCH_PASSWORD`)
+- Gmail IMAP (`GMAIL_IMAP_USER` + `GMAIL_IMAP_APP_PASSWORD`)
+
+Advanced (optional):
+- `config.example.yaml` is an advanced override file. You can pass `--config config.example.yaml`, but most users don’t need YAML at all.
 
 Tip: list common provider slugs (non-exhaustive):
 
@@ -45,22 +65,29 @@ This repo includes a `docker-compose.yml` service that runs the sync as a **run-
 mkdir data
 ```
 
-3. Preflight (inside the container):
+3. One-time: set up your Monarch loan accounts (no manual account ID copying) 🧾
+This will map (and create if needed) **one Monarch manual account per loan group**, and store a stable mapping under `data/` so renaming accounts later won’t break anything.
 
 ```bash
-docker compose run --rm --build studentaid-monarch-sync preflight --config /app/config.yaml
+docker compose run --rm --build studentaid-monarch-sync setup-monarch-accounts --apply
 ```
 
-4. Dry-run:
+4. Preflight (inside the container):
 
 ```bash
-docker compose run --rm studentaid-monarch-sync sync --config /app/config.yaml --dry-run --payments-since 2025-01-01
+docker compose run --rm --build studentaid-monarch-sync preflight
 ```
 
-5. Run for real (writes to Monarch):
+5. Dry-run:
 
 ```bash
-docker compose run --rm studentaid-monarch-sync sync --config /app/config.yaml --payments-since 2025-01-01
+docker compose run --rm studentaid-monarch-sync sync --dry-run --payments-since 2025-01-01
+```
+
+6. Run for real (writes to Monarch):
+
+```bash
+docker compose run --rm studentaid-monarch-sync sync --payments-since 2025-01-01
 ```
 
 ##### Scheduling on Docker Desktop 🗓️
@@ -68,7 +95,7 @@ Docker Desktop doesn’t include a built-in scheduler. The usual pattern is: **u
 To keep the scheduled command simple (and easy to update later), you can schedule a small wrapper script from this repo.
 
 - **Windows (Task Scheduler)**:
-  - Create a task that runs daily.
+  - Create a task that runs daily or weekly.
   - **Program/script**: `C:\Program Files\PowerShell\7\pwsh.exe` (or `powershell.exe`)
   - **Add arguments** (example):
 
@@ -86,7 +113,7 @@ cd /path/to/repo && bash ./scripts/docker_sync.sh run --payments-since 2025-01-0
 ```
 
 - **Linux (cron/systemd)**:
-  - Use cron or a systemd timer to run the same command:
+  - Use cron or a systemd timer to run the same command on your desired timeframe:
 
 ```bash
 cd /path/to/repo && bash ./scripts/docker_sync.sh run --payments-since 2025-01-01
@@ -103,6 +130,7 @@ mkdir -p data
 3. Test-run once (recommended):
 
 ```bash
+bash ./scripts/docker_sync.sh setup-accounts
 bash ./scripts/docker_sync.sh preflight
 bash ./scripts/docker_sync.sh dry-run --payments-since 2025-01-01
 ```
@@ -136,22 +164,29 @@ python3 -m venv .venv
 .venv/bin/python -m playwright install chromium
 ```
 
+**One-time: set up your Monarch loan accounts (no manual account ID copying) 🧾**
+This will map (and create if needed) **one Monarch manual account per loan group**, and store a stable mapping under `data/` so renaming accounts later won’t break anything.
+
+```bash
+.venv\Scripts\python -m studentaid_monarch_sync setup-monarch-accounts --apply
+```
+
 **Preflight (fast fail, no Playwright) ⚡**
 
 ```bash
-.venv\Scripts\python -m studentaid_monarch_sync preflight --config config.yaml
+.venv\Scripts\python -m studentaid_monarch_sync preflight
 ```
 
 **Dry-run (recommended first run) 🧪**
 
 ```bash
-.venv\Scripts\python -m studentaid_monarch_sync sync --config config.yaml --dry-run --headful
+.venv\Scripts\python -m studentaid_monarch_sync sync --dry-run --headful
 ```
 
 **Run for real (writes to Monarch) ✅**
 
 ```bash
-.venv\Scripts\python -m studentaid_monarch_sync sync --config config.yaml --payments-since 2025-01-01 --max-payments 10
+.venv\Scripts\python -m studentaid_monarch_sync sync --payments-since 2025-01-01 --max-payments 10
 ```
 
 **(Optional) Schedule it on Windows 🗓️**

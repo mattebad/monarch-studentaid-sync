@@ -7,10 +7,9 @@ services:
       - .env
     volumes:
       - ./data:/app/data
-      - ./config.yaml:/app/config.yaml:ro
     # Recommended for Chromium/Playwright stability (avoids /dev/shm issues).
     shm_size: "1gb"
-    command: ["sync", "--config", "/app/config.yaml"]
+    command: ["sync"]
     restart: "no"
 
 
