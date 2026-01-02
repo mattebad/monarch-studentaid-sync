@@ -32,9 +32,90 @@ Tip: list common provider slugs (non-exhaustive):
 Security note: don’t commit secrets. Your `.env`, `data/`, and `config.yaml` should stay local. 🔒
 
 #### Choose your runtime 🧭
-Pick **one** of the following and run it end-to-end.
+Pick **one** of the following and run it end-to-end. For most people (especially NAS/Unraid), **Docker is the recommended option** 🐳✅
 
-#### Runtime A: Python (desktop/server) 🐍
+#### Runtime A: Docker (recommended) 🐳
+This repo includes a `docker-compose.yml` service that runs the sync as a **run-once** container.
+
+##### Docker Desktop (Windows/macOS)
+1. Install Docker Desktop and make sure `docker compose` works in a terminal.
+2. From the repo folder, create the persistent `data/` folder (stores logs, SQLite state, and Playwright session):
+
+```bash
+mkdir data
+```
+
+3. Preflight (inside the container):
+
+```bash
+docker compose run --rm --build studentaid-monarch-sync preflight --config /app/config.yaml
+```
+
+4. Dry-run:
+
+```bash
+docker compose run --rm studentaid-monarch-sync sync --config /app/config.yaml --dry-run --payments-since 2025-01-01
+```
+
+5. Run for real (writes to Monarch):
+
+```bash
+docker compose run --rm studentaid-monarch-sync sync --config /app/config.yaml --payments-since 2025-01-01
+```
+
+##### Scheduling on Docker Desktop 🗓️
+Docker Desktop doesn’t include a built-in scheduler. The usual pattern is: **use your host OS scheduler** to run the sync command.
+To keep the scheduled command simple (and easy to update later), you can schedule a small wrapper script from this repo.
+
+- **Windows (Task Scheduler)**:
+  - Create a task that runs daily.
+  - **Program/script**: `C:\Program Files\PowerShell\7\pwsh.exe` (or `powershell.exe`)
+  - **Add arguments** (example):
+
+```text
+-NoProfile -File .\scripts\docker_sync.ps1 run --payments-since 2025-01-01
+```
+
+  - **Start in**: `C:\path\to\repo` (the folder that contains `docker-compose.yml`)
+
+- **macOS (launchd)**:
+  - Create a LaunchAgent that runs:
+
+```bash
+cd /path/to/repo && bash ./scripts/docker_sync.sh run --payments-since 2025-01-01
+```
+
+- **Linux (cron/systemd)**:
+  - Use cron or a systemd timer to run the same command:
+
+```bash
+cd /path/to/repo && bash ./scripts/docker_sync.sh run --payments-since 2025-01-01
+```
+
+##### Unraid (NAS)
+1. Put the repo on persistent storage (or copy just `docker-compose.yml`, `config.yaml`, `.env`, and create `data/`).
+2. Create the persistent `data/` folder:
+
+```bash
+mkdir -p data
+```
+
+3. Test-run once (recommended):
+
+```bash
+bash ./scripts/docker_sync.sh preflight
+bash ./scripts/docker_sync.sh dry-run --payments-since 2025-01-01
+```
+
+4. Schedule it (e.g., Unraid **User Scripts** plugin) with a daily command like:
+
+```bash
+cd /path/to/repo && bash ./scripts/docker_sync.sh run --payments-since 2025-01-01
+```
+
+Keep `./data` persistent so sessions and the SQLite idempotency DB survive restarts.
+
+#### Runtime B: Python (desktop/server) 🐍
 **Install**
 
 - **Windows**:
@@ -73,32 +154,31 @@ python3 -m venv .venv
 .venv\Scripts\python -m studentaid_monarch_sync sync --config config.yaml --payments-since 2025-01-01 --max-payments 10
 ```
 
-#### Runtime B: Docker (NAS / Unraid) 🐳
-This repo includes a `docker-compose.yml` service that runs the sync as a **run-once** container.
+**(Optional) Schedule it on Windows 🗓️**
+If you want this to run daily on Windows, use **Task Scheduler**:
 
-1. Create the persistent `data/` folder (stores logs, SQLite state, and Playwright session):
+1. Open **Task Scheduler** → **Create Task…**
+2. **General**:
+   - Name: `Monarch Student Loan Sync`
+   - Select **Run whether user is logged on or not**
+   - Check **Run with highest privileges** (helps with browser automation)
+3. **Triggers**:
+   - New… → Daily (pick your time)
+4. **Actions**:
+   - New… → **Start a program**
+   - **Program/script**: `C:\path\to\repo\.venv\Scripts\python.exe`
+   - **Add arguments**:
 
-```bash
-mkdir data
+```text
+-m studentaid_monarch_sync sync --config config.yaml --payments-since 2025-01-01
 ```
 
-2. Preflight (inside the container):
+   - **Start in**: `C:\path\to\repo`
+5. **Settings** (recommended):
+   - Allow task to be run on demand
+   - If the task fails, restart every: 5 minutes (up to a few times)
 
-```bash
-docker compose run --rm --build studentaid-monarch-sync preflight --config /app/config.yaml
-```
-
-3. Dry-run:
-
-```bash
-docker compose run --rm studentaid-monarch-sync sync --config /app/config.yaml --dry-run --payments-since 2025-01-01
-```
-
-4. Run for real (writes to Monarch):
-
-```bash
-docker compose run --rm studentaid-monarch-sync sync --config /app/config.yaml --payments-since 2025-01-01
-```
+Tip: run the exact command once in PowerShell first to confirm it works before scheduling.
 
 ## Advanced (details / Docker / troubleshooting)
 
@@ -166,15 +246,8 @@ If a `sync` run fails, the CLI will automatically create a zip under `data/` con
 
 You can attach that zip when asking for help.
 
-### Unraid notes (scheduling)
-- Run it as a **run-once** container on a schedule (daily is typical).
-- Create a scheduled job (e.g., Unraid **User Scripts**) that runs:
-
-```bash
-docker compose run --rm studentaid-monarch-sync sync --config /app/config.yaml --payments-since 2025-01-01
-```
-
-- Keep `./data` on persistent storage so sessions and the SQLite idempotency DB survive restarts.
+### Docker scheduling (Unraid/NAS)
+See **Quick start → Runtime A: Docker (recommended)** for the Unraid scheduling command and persistence notes.
 
 ### Notes / stability
 - StudentAid servicer portals are web portals; UI changes may break selectors. The code is structured so selectors live in one place, and failures should save screenshots/logs for debugging.
