@@ -1,10 +1,106 @@
-## StudentAid servicer → Monarch student loan sync (automation)
+## Monarch Student Loan Sync 🧾✨
 
-This project automates:
+This project automates (so you don’t have to click through portals every day):
 - **Daily balance updates** for each loan group (AA/AB/…)
 - **Payment-posted transactions** in Monarch (one per loan group allocation), categorized as **Transfer**
 
-Target: run **unattended** in Docker/Unraid, with **email MFA** handled via **Gmail IMAP + App Password**.
+It’s designed to run **unattended** (Docker/Unraid), with **email MFA** handled via **Gmail IMAP + App Password**. 🤖📬
+
+### Quick start (most users) 🚀
+This guide is linear: **Prereqs → Configure → Choose a runtime (Python or Docker) → Preflight → Dry-run → Run**.
+
+#### Prereqs (set these up once) ✅
+- **Monarch auth** (choose one):
+  - **Email/password**: set `MONARCH_EMAIL` + `MONARCH_PASSWORD`
+  - **Sign in with Apple**: set `MONARCH_TOKEN` (preferred). If you need help extracting it, see [Getting `MONARCH_TOKEN`](#monarch-token) 🍎
+- **Gmail IMAP for MFA**
+  - You’ll need **IMAP enabled** + **2‑Step Verification** + a **Google App Password**.
+  - If you want the step-by-step Gmail label/filter setup (recommended), see [Gmail IMAP setup](#gmail-imap-setup) 🏷️
+
+#### Configure 🛠️
+1. Copy `env.example` → `.env` and fill in values (Monarch + Gmail IMAP).
+2. Copy `config.example.yaml` → `config.yaml`, then:
+   - Set `servicer.provider` (e.g. `cri`, `nelnet`, `mohela`)
+   - Map your **loan groups** to your Monarch **manual accounts**
+
+Tip: list common provider slugs (non-exhaustive):
+
+```bash
+.venv\Scripts\python -m studentaid_monarch_sync list-servicers
+```
+
+Security note: don’t commit secrets. Your `.env`, `data/`, and `config.yaml` should stay local. 🔒
+
+#### Choose your runtime 🧭
+Pick **one** of the following and run it end-to-end.
+
+#### Runtime A: Python (desktop/server) 🐍
+**Install**
+
+- **Windows**:
+
+```bash
+python -m venv .venv
+.venv\Scripts\python -m pip install -r requirements.txt
+.venv\Scripts\python -m pip install -e .
+.venv\Scripts\python -m playwright install chromium
+```
+
+- **Linux / macOS**:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m pip install -e .
+.venv/bin/python -m playwright install chromium
+```
+
+**Preflight (fast fail, no Playwright) ⚡**
+
+```bash
+.venv\Scripts\python -m studentaid_monarch_sync preflight --config config.yaml
+```
+
+**Dry-run (recommended first run) 🧪**
+
+```bash
+.venv\Scripts\python -m studentaid_monarch_sync sync --config config.yaml --dry-run --headful
+```
+
+**Run for real (writes to Monarch) ✅**
+
+```bash
+.venv\Scripts\python -m studentaid_monarch_sync sync --config config.yaml --payments-since 2025-01-01 --max-payments 10
+```
+
+#### Runtime B: Docker (NAS / Unraid) 🐳
+This repo includes a `docker-compose.yml` service that runs the sync as a **run-once** container.
+
+1. Create the persistent `data/` folder (stores logs, SQLite state, and Playwright session):
+
+```bash
+mkdir data
+```
+
+2. Preflight (inside the container):
+
+```bash
+docker compose run --rm --build studentaid-monarch-sync preflight --config /app/config.yaml
+```
+
+3. Dry-run:
+
+```bash
+docker compose run --rm studentaid-monarch-sync sync --config /app/config.yaml --dry-run --payments-since 2025-01-01
+```
+
+4. Run for real (writes to Monarch):
+
+```bash
+docker compose run --rm studentaid-monarch-sync sync --config /app/config.yaml --payments-since 2025-01-01
+```
+
+## Advanced (details / Docker / troubleshooting)
 
 ### How it works (high level)
 - Logs into your servicer portal (typically `https://{provider}.studentaid.gov`) with Playwright
@@ -14,16 +110,7 @@ Target: run **unattended** in Docker/Unraid, with **email MFA** handled via **Gm
 - Stores a small SQLite state DB so runs are **idempotent** (no duplicate payment transactions)
 - Includes an extra **duplicate guard** against Monarch itself: **date + amount + merchant** (so even if you reset SQLite, we won't spam duplicates)
 
-### Prereqs
-- **Python 3.11+** recommended
-- A **Gmail account** that receives MFA emails
-  - Enable Google 2‑Step Verification
-  - Create an **App Password**
-  - Ensure IMAP access is enabled for the mailbox
-- Monarch auth:
-  - If you log in with email/password: set `MONARCH_EMAIL` + `MONARCH_PASSWORD`
-  - If you use **Sign in with Apple**: set `MONARCH_TOKEN` (preferred) and leave password blank
-
+<a id="gmail-imap-setup"></a>
 ### Gmail IMAP setup (App Password + label/filter) — recommended
 This makes MFA automation reliable and keeps old/stale codes out of your inbox.
 
@@ -60,64 +147,6 @@ This makes MFA automation reliable and keeps old/stale codes out of your inbox.
   - Example sender we’ve seen: `CRINoReply@cri.studentaid.gov`
     - Other servicers are likely similar (`<something>@<provider>.studentaid.gov`), but we don’t rely on that—use the hints above.
 
-- **Verify**
-  - Run preflight (no Playwright):
-
-```bash
-.venv\Scripts\python -m studentaid_monarch_sync preflight --config config.yaml
-```
-
-### Setup (Windows dev)
-1. Create a venv and install deps:
-
-```bash
-cd "%USERPROFILE%\Documents\Monarch_Loan_Script"
-python -m venv .venv
-.venv\Scripts\python -m pip install -r requirements.txt
-.venv\Scripts\python -m pip install -e .
-```
-
-2. Install Playwright browser:
-
-```bash
-.venv\Scripts\python -m playwright install chromium
-```
-
-3. Create `.env` and config:
-- Copy `env.example` → `.env` and fill values
-- Start from `config.example.yaml` → `config.yaml`, then:
-  - Set `servicer.provider` (e.g. `cri`, `nelnet`, `mohela`)
-  - Adjust your loan group → Monarch account mappings
-
-Tip: run `studentaid_monarch_sync list-servicers` to see common provider slugs (non-exhaustive).
-
-#### Getting `MONARCH_TOKEN` (for Sign in with Apple)
-1. Log into Monarch in your browser normally (using Apple).
-2. Open DevTools → **Network** tab.
-3. Click any request to Monarch’s API (often `graphql`).
-4. In **Request Headers**, copy the value after `Authorization: Token ...`.
-5. Put that into `.env` as `MONARCH_TOKEN=...` (keep it secret).
-
-4. Run a dry-run sync:
-
-```bash
-.venv\Scripts\python -m studentaid_monarch_sync sync --config config.yaml --dry-run --headful
-```
-
-### Preflight checks (recommended before unattended runs)
-Validate external dependencies **before** opening Playwright:
-
-```bash
-.venv\Scripts\python -m studentaid_monarch_sync preflight --config config.yaml
-```
-
-### Debug bundle (auto-created on failures)
-If a `sync` run fails, the CLI will automatically create a zip under `data/` containing:
-- `data/debug/*` (screenshots/HTML)
-- your configured log file (default: `data/sync.log`)
-
-You can attach that zip when asking for help.
-
 ### Dry-run that ALSO checks Monarch (recommended)
 Standard dry-run **does not** call Monarch (it only prints what it would do based on the portal + local SQLite).
 If you want to validate the real behavior end-to-end (including the duplicate guard), run:
@@ -130,42 +159,22 @@ This logs into Monarch in **read-only** mode and prints each payment allocation 
 - `SKIP (duplicate)` if Monarch already has a txn with the same **date + amount + merchant**
 - `CREATE` if it would create a new txn
 
-### Run for real (writes to Monarch)
-Once you're happy with the dry-run output, run the same command **without** `--dry-run`:
+### Debug bundle (auto-created on failures)
+If a `sync` run fails, the CLI will automatically create a zip under `data/` containing:
+- `data/debug/*` (screenshots/HTML)
+- your configured log file (default: `data/sync.log`)
+
+You can attach that zip when asking for help.
+
+### Unraid notes (scheduling)
+- Run it as a **run-once** container on a schedule (daily is typical).
+- Create a scheduled job (e.g., Unraid **User Scripts**) that runs:
 
 ```bash
-.venv\Scripts\python -m studentaid_monarch_sync sync --config config.yaml --payments-since 2025-01-01 --max-payments 1
+docker compose run --rm studentaid-monarch-sync sync --config /app/config.yaml --payments-since 2025-01-01
 ```
 
-For the first real run, using `--headful` is a good idea so you can watch login/MFA:
-
-```bash
-.venv\Scripts\python -m studentaid_monarch_sync sync --config config.yaml --headful --payments-since 2025-01-01 --max-payments 1
-```
-
-### Run (Docker / Unraid)
-This project is designed to run as a **run-once container** on a schedule (daily is typical).
-
-1. Create config + env:
-- Copy `env.example` → `.env`
-- Create an empty `data/` folder (holds SQLite + session cookies + logs)
-
-2. Run with docker compose:
-
-```bash
-cd /path/to/Monarch_Loan_Script
-docker compose up --build --abort-on-container-exit
-```
-
-Or run one-shot directly:
-
-```bash
-docker compose run --rm studentaid-monarch-sync sync --config /app/config.yaml
-```
-
-3. On Unraid:
-- Create a daily scheduled job (e.g., User Scripts plugin) that runs the one-shot command above.
-- Keep `./data` on persistent storage so Monarch sessions and the SQLite idempotency DB survive restarts.
+- Keep `./data` on persistent storage so sessions and the SQLite idempotency DB survive restarts.
 
 ### Notes / stability
 - StudentAid servicer portals are web portals; UI changes may break selectors. The code is structured so selectors live in one place, and failures should save screenshots/logs for debugging.
@@ -187,6 +196,14 @@ docker compose run --rm studentaid-monarch-sync sync --config /app/config.yaml
 ### Config notes (Monarch payments)
 - `monarch.payment_merchant_name`: merchant name to use when creating payment transactions, and the value used by the **duplicate guard**.
   - If your existing loan-account payments show up as **US Department of Education**, set this to that (recommended).
+
+<a id="monarch-token"></a>
+### Getting `MONARCH_TOKEN` (for Sign in with Apple)
+1. Log into Monarch in your browser normally (using Apple).
+2. Open DevTools → **Network** tab.
+3. Click any request to Monarch’s API (often `graphql`).
+4. In **Request Headers**, copy the value after `Authorization: Token ...`.
+5. Put that into `.env` as `MONARCH_TOKEN=...` (keep it secret).
 
 ### CLI flags (reference)
 Run `-h` at any time to see the full help:
@@ -217,5 +234,4 @@ Run `-h` at any time to see the full help:
 
 #### `list-monarch-accounts` flags
 - `--config`: Path to YAML config (default: `config.yaml`).
-
 
