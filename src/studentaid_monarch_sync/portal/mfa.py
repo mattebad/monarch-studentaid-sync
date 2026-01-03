@@ -17,6 +17,28 @@ from ..config import GmailImapConfig
 logger = logging.getLogger(__name__)
 
 
+def _safe_imap_logout(mail: Optional[imaplib.IMAP4_SSL]) -> None:
+    if mail is None:
+        return
+    try:
+        mail.close()
+    except Exception:
+        pass
+    try:
+        mail.logout()
+    except Exception:
+        pass
+
+
+def _imap_connect_and_select(cfg: GmailImapConfig) -> imaplib.IMAP4_SSL:
+    mail = imaplib.IMAP4_SSL("imap.gmail.com", 993)
+    mail.login(cfg.user, cfg.app_password)
+    sel_status, _ = mail.select(cfg.folder)
+    if sel_status != "OK":
+        raise RuntimeError(f"IMAP select failed for folder={cfg.folder!r}: {sel_status}")
+    return mail
+
+
 def poll_gmail_imap_for_code(
     cfg: GmailImapConfig,
     *,
@@ -55,22 +77,41 @@ def poll_gmail_imap_for_code(
         re.compile(r"six[-\s]?digit[^0-9]{0,50}(\d{6})", re.I),
     ]
 
-    while time.time() < deadline:
-        try:
-            code = _try_fetch_code_once(
-                cfg,
-                code_re=code_re,
-                preferred_res=preferred_res,
-                min_received_at=min_received_at,
-                print_code=print_code,
-                checked_msg_ids=checked_msg_ids,
-            )
-            if code:
-                return code
-        except Exception:
-            logger.debug("IMAP poll attempt failed; retrying.", exc_info=True)
+    mail: Optional[imaplib.IMAP4_SSL] = None
+    try:
+        while time.time() < deadline:
+            try:
+                # Reuse a single IMAP session across polls to avoid repeated TLS handshakes/logins
+                # (which can be slow and can trip Gmail security throttles).
+                if mail is None:
+                    mail = _imap_connect_and_select(cfg)
+                else:
+                    try:
+                        mail.noop()
+                    except Exception:
+                        _safe_imap_logout(mail)
+                        mail = _imap_connect_and_select(cfg)
 
-        time.sleep(poll_interval_seconds)
+                code = _try_fetch_code_once(
+                    cfg,
+                    mail=mail,
+                    code_re=code_re,
+                    preferred_res=preferred_res,
+                    min_received_at=min_received_at,
+                    print_code=print_code,
+                    checked_msg_ids=checked_msg_ids,
+                )
+                if code:
+                    return code
+            except Exception:
+                # Best-effort: reconnect on transient failures.
+                logger.debug("IMAP poll attempt failed; reconnecting.", exc_info=True)
+                _safe_imap_logout(mail)
+                mail = None
+
+            time.sleep(poll_interval_seconds)
+    finally:
+        _safe_imap_logout(mail)
 
     raise TimeoutError(f"Timed out waiting for MFA code email after {timeout_seconds}s")
 
@@ -78,15 +119,15 @@ def poll_gmail_imap_for_code(
 def _try_fetch_code_once(
     cfg: GmailImapConfig,
     *,
+    mail: imaplib.IMAP4_SSL,
     code_re: re.Pattern[str],
     preferred_res: list[re.Pattern[str]],
     min_received_at: datetime,
     print_code: bool,
     checked_msg_ids: set[bytes],
 ) -> Optional[str]:
-    mail = imaplib.IMAP4_SSL("imap.gmail.com", 993)
     try:
-        mail.login(cfg.user, cfg.app_password)
+        # Re-select in case the server dropped the selected mailbox between polls.
         sel_status, _ = mail.select(cfg.folder)
         if sel_status != "OK":
             raise RuntimeError(f"IMAP select failed for folder={cfg.folder!r}: {sel_status}")
@@ -156,15 +197,6 @@ def _try_fetch_code_once(
             return code
 
         return None
-    finally:
-        try:
-            mail.close()
-        except Exception:
-            pass
-        try:
-            mail.logout()
-        except Exception:
-            pass
 
 
 def _extract_best_effort_body(msg: Message) -> str:
