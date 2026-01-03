@@ -6,8 +6,8 @@ python-dateutil==2.9.0.post0
 tenacity==9.0.0
 requests==2.32.3
 
-# Monarch API client (unofficial)
-git+https://github.com/hammem/monarchmoney.git
+# Monarch API client (unofficial) — pin to a commit for reproducible builds.
+git+https://github.com/hammem/monarchmoney.git@98a6e0d009c575188ffa28f00e6b9f8e2d41c11b
 
 # Tests (fast, no secrets)
 pytest==8.3.4
