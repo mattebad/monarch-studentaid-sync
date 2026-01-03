@@ -225,7 +225,8 @@ Tip: run the exact command once in PowerShell first to confirm it works before s
 - Scrapes per-loan balances + payment allocation details
 - Pushes updates into Monarch via the unofficial Monarch API client
 - Stores a small SQLite state DB so runs are **idempotent** (no duplicate payment transactions)
-- Includes an extra **duplicate guard** against Monarch itself: **date + amount + merchant** (so even if you reset SQLite, we won't spam duplicates)
+- Includes an extra **duplicate guard** against Monarch itself: **date + amount + merchant** (so even if you reset SQLite, we won't spam duplicates).
+  - Optional: you can enable a more specific duplicate check that also uses the portal’s **payment confirmation/reference** as a search term (see [Config notes (Monarch payments)](#config-notes-monarch-payments)).
 
 <a id="gmail-imap-setup"></a>
 ### Gmail IMAP setup (App Password + label/filter) — recommended
@@ -278,10 +279,18 @@ This logs into Monarch in **read-only** mode and prints each payment allocation 
 
 ### Debug bundle (auto-created on failures)
 If a `sync` run fails, the CLI will automatically create a zip under `data/` containing:
-- `data/debug/*` (screenshots/HTML)
+- `data/debug/*` (screenshots/HTML/text snapshots)
 - your configured log file (default: `data/sync.log`)
 
 You can attach that zip when asking for help.
+
+#### Parsing debug text snapshots (offline)
+Debug bundles include `*.txt` snapshots of the portal’s rendered page text. You can parse these offline into JSON:
+
+```bash
+python3 scripts/parse_portal_text_snapshot.py loans --groups AA,AB --file data/debug/loan_details_not_loaded.txt
+python3 scripts/parse_portal_text_snapshot.py payments --file data/debug/payment_detail_0_error.txt
+```
 
 ### Docker scheduling (Unraid/NAS)
 See **Quick start → Runtime A: Docker (recommended)** for the Unraid scheduling command and persistence notes.
@@ -306,6 +315,7 @@ See **Quick start → Runtime A: Docker (recommended)** for the Unraid schedulin
 ### Config notes (Monarch payments)
 - `monarch.payment_merchant_name`: merchant name to use when creating payment transactions, and the value used by the **duplicate guard**.
   - If your existing loan-account payments show up as **US Department of Education**, set this to that (recommended).
+- `monarch.duplicate_guard_use_reference` / `MONARCH_DUPLICATE_GUARD_USE_REFERENCE` (optional): when the portal provides a payment confirmation/reference, use it as a Monarch search term during duplicate detection to reduce false positives for same-day identical payments.
 
 <a id="monarch-token"></a>
 ### Getting `MONARCH_TOKEN` (for Sign in with Apple)
