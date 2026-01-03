@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import re
 import json
@@ -11,6 +12,8 @@ from urllib.parse import urlparse
 import yaml
 from pydantic import BaseModel, Field, model_validator
 
+
+logger = logging.getLogger(__name__)
 
 _ENV_VAR_PATTERN = re.compile(r"\$\{([A-Z0-9_]+)\}")
 _PROVIDER_SLUG_RE = re.compile(r"^[a-z0-9-]+$")
@@ -82,17 +85,27 @@ def _parse_loan_groups_env(value: str) -> list[str]:
 
     out: list[str] = []
     seen: set[str] = set()
+    invalid: list[str] = []
     for item in items:
-        g = (item or "").strip().upper()
-        if not g:
+        raw = (item or "").strip()
+        if not raw:
             continue
+        g = raw.upper()
         if not _LOAN_GROUP_RE.match(g):
             # Keep it permissive but predictable: skip junk tokens rather than crashing.
+            invalid.append(raw)
             continue
         if g in seen:
             continue
         out.append(g)
         seen.add(g)
+
+    if invalid:
+        logger.warning(
+            "Ignoring invalid LOAN_GROUPS tokens: %s (expected group codes like 'AA' matching %s)",
+            ", ".join(invalid),
+            _LOAN_GROUP_RE.pattern,
+        )
     return out
 
 
@@ -128,6 +141,9 @@ def _default_config_from_env() -> dict:
             "session_file": os.getenv("MONARCH_SESSION_FILE", "data/monarch_session.pickle"),
             "loan_account_name_template": os.getenv("MONARCH_LOAN_ACCOUNT_NAME_TEMPLATE", "{provider}-{group}"),
             "auto_create_loan_accounts": _env_bool("MONARCH_AUTO_CREATE_LOAN_ACCOUNTS", default=False),
+            # Optional: refine the Monarch-side duplicate guard by using the portal's payment reference
+            # (confirmation number) as a search term. Off by default because it relies on Monarch search semantics.
+            "duplicate_guard_use_reference": _env_bool("MONARCH_DUPLICATE_GUARD_USE_REFERENCE", default=False),
         },
         "state": {
             "db_path": os.getenv("STATE_DB_PATH", "data/state.db"),
@@ -211,6 +227,9 @@ class MonarchConfig(BaseModel):
     # If enabled, `sync --auto-setup-accounts` (or future automation) can create missing manual accounts.
     # We keep this default False to avoid surprising writes to Monarch without explicit intent.
     auto_create_loan_accounts: bool = False
+    # Optional: when the portal provides a confirmation/reference for a payment, use it as a search term
+    # for Monarch duplicate detection to reduce false positives when two payments share date+amount+merchant.
+    duplicate_guard_use_reference: bool = False
 
     @model_validator(mode="after")
     def _validate_auth(self) -> "MonarchConfig":

@@ -30,6 +30,9 @@ monarch:
   transfer_category_name: "Transfer"
   # Merchant name to use for payment transactions (also used by dupe-check: date + amount + merchant)
   payment_merchant_name: "US Department of Education"
+  # Optional: refine the Monarch-side duplicate guard by using the portal's payment confirmation/reference
+  # number as a search term. Off by default.
+  duplicate_guard_use_reference: "${MONARCH_DUPLICATE_GUARD_USE_REFERENCE}"
   session_file: "data/monarch_session.pickle"
   # Optional: naming scheme for loan-group manual accounts (used for auto-mapping / auto-creation).
   # Placeholders: {provider}, {provider_upper}, {provider_display}, {group}
