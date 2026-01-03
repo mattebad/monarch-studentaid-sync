@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import date, timedelta
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any, Tuple, Callable, Awaitable, TypeVar
 
 from monarchmoney import MonarchMoney
 
@@ -13,6 +14,7 @@ from ..util.money import cents_to_money_str
 
 
 logger = logging.getLogger(__name__)
+T = TypeVar("T")
 
 
 def _cents_to_dollars(cents: int) -> float:
@@ -65,6 +67,65 @@ class MonarchClient:
         self._transactions_cache: dict[tuple[str, str, str, int, int, str], List[Dict[str, Any]]] = {}
         self._student_loan_type_subtype: Optional[Tuple[str, str]] = None
 
+    async def _call_with_retry(self, op: str, fn: Callable[[], Awaitable[T]]) -> T:
+        """
+        Best-effort retry wrapper for Monarch API calls.
+
+        Notes:
+        - Only used for READ operations (and idempotent writes like "set balance"), not for create operations.
+        - We deliberately do not retry on ValueError (usually indicates a caller/config issue).
+        """
+        attempts = 3
+        base_delay_s = 0.25
+        max_delay_s = 2.0
+
+        last_exc: Optional[BaseException] = None
+        for attempt in range(1, attempts + 1):
+            try:
+                return await fn()
+            except Exception as e:
+                last_exc = e
+                if isinstance(e, ValueError):
+                    raise
+                if attempt >= attempts:
+                    raise
+                delay = min(base_delay_s * (2 ** (attempt - 1)), max_delay_s)
+                logger.warning(
+                    "Monarch %s failed (attempt %d/%d); retrying in %.2fs. (%s)",
+                    op,
+                    attempt,
+                    attempts,
+                    delay,
+                    e,
+                )
+                try:
+                    await asyncio.sleep(delay)
+                except Exception:
+                    # best-effort; if the event loop is shutting down, just retry immediately
+                    pass
+
+        # Should be unreachable, but keeps type checkers happy.
+        raise RuntimeError(f"Monarch {op} failed after {attempts} attempts") from last_exc
+
+    def _invalidate_transactions_cache(self, *, account_id: str = "") -> None:
+        """
+        Bust the in-memory transactions cache.
+
+        This is important after mutating calls (create_transaction) because our duplicate-guard logic
+        relies on re-fetching recent transactions. Without invalidation, a run that:
+          1) checks for duplicates (caches transactions)
+          2) creates a new transaction
+          3) checks again for the same day/account
+        could miss the newly-created txn and accidentally create duplicates.
+        """
+        if not account_id:
+            self._transactions_cache.clear()
+            return
+
+        doomed = [k for k in self._transactions_cache.keys() if k and k[0] == account_id]
+        for k in doomed:
+            self._transactions_cache.pop(k, None)
+
     async def login(self) -> None:
         # Ensure the session directory exists (important for commands like list-monarch-accounts).
         session_path = Path(self._session_file)
@@ -98,19 +159,19 @@ class MonarchClient:
 
     async def list_accounts(self) -> List[Dict[str, Any]]:
         if self._accounts_cache is None:
-            resp = await self._mm.get_accounts()
+            resp = await self._call_with_retry("get_accounts", lambda: self._mm.get_accounts())
             self._accounts_cache = resp.get("accounts", [])
         return list(self._accounts_cache)
 
     async def list_categories(self) -> List[Dict[str, Any]]:
         if self._category_cache is None:
-            resp = await self._mm.get_transaction_categories()
+            resp = await self._call_with_retry("get_transaction_categories", lambda: self._mm.get_transaction_categories())
             self._category_cache = resp.get("categories", [])
         return list(self._category_cache)
 
     async def list_account_type_options(self) -> List[Dict[str, Any]]:
         if self._account_type_options_cache is None:
-            resp = await self._mm.get_account_type_options()
+            resp = await self._call_with_retry("get_account_type_options", lambda: self._mm.get_account_type_options())
             self._account_type_options_cache = resp.get("accountTypeOptions", []) or []
         return list(self._account_type_options_cache)
 
@@ -231,7 +292,7 @@ class MonarchClient:
     async def update_account_balance(self, *, account_id: str, balance_cents: int) -> None:
         bal = _cents_to_dollars(balance_cents)
         logger.info("Updating Monarch account %s balance -> %s", account_id, cents_to_money_str(balance_cents))
-        await self._mm.update_account(account_id=account_id, account_balance=bal)
+        await self._call_with_retry("update_account(balance)", lambda: self._mm.update_account(account_id=account_id, account_balance=bal))
 
     async def create_payment_transaction(
         self,
@@ -251,18 +312,45 @@ class MonarchClient:
             posted_date_iso,
             cents_to_money_str(amount_cents),
         )
-        resp = await self._mm.create_transaction(
-            date=posted_date_iso,
-            account_id=account_id,
-            amount=amt,
-            merchant_name=merchant_name,
-            category_id=category_id,
-            notes=memo,
-            update_balance=update_balance,
-        )
-        txn = (resp.get("createTransaction") or {}).get("transaction") or {}
-        txn_id = txn.get("id") or ""
-        return str(txn_id)
+        try:
+            resp = await self._mm.create_transaction(
+                date=posted_date_iso,
+                account_id=account_id,
+                amount=amt,
+                merchant_name=merchant_name,
+                category_id=category_id,
+                notes=memo,
+                update_balance=update_balance,
+            )
+            txn = (resp.get("createTransaction") or {}).get("transaction") or {}
+            txn_id = str(txn.get("id") or "")
+
+            # The newly-created txn may affect duplicate-guard decisions later in this run.
+            self._invalidate_transactions_cache(account_id=account_id)
+            return txn_id
+        except Exception as e:
+            # The request may have been accepted server-side but failed client-side (timeout, connection reset, etc).
+            # To keep runs unattended and idempotent, re-check for the expected txn before failing.
+            logger.warning(
+                "Monarch create_transaction failed; checking for an already-created txn (date+amount+merchant) before raising. (%s)",
+                e,
+            )
+            try:
+                # Important: if we already queried transactions earlier in the run, the in-memory cache is now
+                # stale and can hide the newly-created transaction.
+                self._invalidate_transactions_cache(account_id=account_id)
+                dup = await self.find_duplicate_transaction(
+                    account_id=account_id,
+                    posted_date_iso=posted_date_iso,
+                    amount_cents=amount_cents,
+                    merchant_name=merchant_name,
+                    date_window_days=0,
+                )
+                if dup:
+                    return str(dup.get("id") or "")
+            except Exception:
+                logger.debug("Failed to confirm txn existence after create_transaction error.", exc_info=True)
+            raise
 
     async def list_transactions(
         self,
@@ -293,7 +381,7 @@ class MonarchClient:
             kwargs["start_date"] = start_date_iso
             kwargs["end_date"] = end_date_iso
 
-        resp = await self._mm.get_transactions(**kwargs)
+        resp = await self._call_with_retry("get_transactions", lambda: self._mm.get_transactions(**kwargs))
         txns = (resp.get("allTransactions") or {}).get("results") or []
         out = [dict(t) for t in txns]
         self._transactions_cache[cache_key] = out
@@ -314,34 +402,50 @@ class MonarchClient:
         amount_cents: int,
         merchant_name: str,
         date_window_days: int = 0,
+        max_pages: int = 5,
+        search: str = "",
     ) -> Optional[Dict[str, Any]]:
         """
         Look for an existing transaction matching date + amount + merchant.
         Returns the matching transaction dict if found.
+
+        We page through results because Monarch may return more than our per-request limit for
+        a date range (especially if a user has many transactions on a given day).
         """
         start_dt = date.fromisoformat(posted_date_iso) - timedelta(days=date_window_days)
         end_dt = date.fromisoformat(posted_date_iso) + timedelta(days=date_window_days)
         start_iso = start_dt.isoformat()
         end_iso = end_dt.isoformat()
 
-        txns = await self.list_transactions(
-            account_id=account_id,
-            start_date_iso=start_iso,
-            end_date_iso=end_iso,
-            limit=200,
-            offset=0,
-        )
-
+        page_size = 200
+        pages = max(1, int(max_pages or 0))
+        want_amount_cents = int(amount_cents)
         want_merchant = (merchant_name or "").strip().lower()
-        for t in txns:
-            if (t.get("date") or "") != posted_date_iso:
-                continue
-            if _dollars_to_cents(t.get("amount")) != int(amount_cents):
-                continue
-            got_merchant = _txn_merchant_name(t).strip().lower()
-            if got_merchant != want_merchant:
-                continue
-            return t
+        search_term = (search or "").strip()
+
+        for page in range(pages):
+            txns = await self.list_transactions(
+                account_id=account_id,
+                start_date_iso=start_iso,
+                end_date_iso=end_iso,
+                limit=page_size,
+                offset=page * page_size,
+                search=search_term,
+            )
+
+            for t in txns:
+                if (t.get("date") or "") != posted_date_iso:
+                    continue
+                if _dollars_to_cents(t.get("amount")) != want_amount_cents:
+                    continue
+                got_merchant = _txn_merchant_name(t).strip().lower()
+                if got_merchant != want_merchant:
+                    continue
+                return t
+
+            # If we didn't fill the page, there are no more results.
+            if len(txns) < page_size:
+                break
 
         return None
 
