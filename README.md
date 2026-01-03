@@ -46,10 +46,9 @@ Advanced (optional):
 Tip: list common provider slugs (non-exhaustive):
 
 ```bash
-.venv\Scripts\python -m studentaid_monarch_sync list-servicers
+docker compose run --rm --build studentaid-monarch-sync list-servicers
 ```
 
-Security note: don’t commit secrets. Your `.env`, `data/`, and `config.yaml` should stay local. 🔒
 
 #### Choose your runtime 🧭
 Pick **one** of the following and run it end-to-end. For most people (especially NAS/Unraid), **Docker is the recommended option** 🐳✅
@@ -120,7 +119,7 @@ cd /path/to/repo && bash ./scripts/docker_sync.sh run --payments-since 2025-01-0
 ```
 
 ##### Unraid (NAS)
-1. Put the repo on persistent storage (or copy just `docker-compose.yml`, `config.yaml`, `.env`, and create `data/`).
+1. Put the repo on persistent storage (or copy just `docker-compose.yml`, `.env`, and create `data/`).
 2. Create the persistent `data/` folder:
 
 ```bash
@@ -205,7 +204,7 @@ If you want this to run daily on Windows, use **Task Scheduler**:
    - **Add arguments**:
 
 ```text
--m studentaid_monarch_sync sync --config config.yaml --payments-since 2025-01-01
+-m studentaid_monarch_sync sync --payments-since 2025-01-01
 ```
 
    - **Start in**: `C:\path\to\repo`
@@ -267,7 +266,7 @@ Standard dry-run **does not** call Monarch (it only prints what it would do base
 If you want to validate the real behavior end-to-end (including the duplicate guard), run:
 
 ```bash
-.venv\Scripts\python -m studentaid_monarch_sync sync --config config.yaml --dry-run --dry-run-check-monarch --headful --payments-since 2025-01-01 --max-payments 1
+.venv\Scripts\python -m studentaid_monarch_sync sync --dry-run --dry-run-check-monarch --headful --payments-since 2025-01-01 --max-payments 1
 ```
 
 This logs into Monarch in **read-only** mode and prints each payment allocation as:
@@ -325,7 +324,7 @@ Run `-h` at any time to see the full help:
 - `--env-file`: Path to a dotenv file (default: `.env`). If present, it will be loaded before reading config/env vars.
 
 #### `sync` flags
-- `--config`: Path to YAML config (default: `config.yaml`).
+- `--config`: Path to YAML config (optional; default: `config.yaml` if you use one).
 - `--dry-run`: Do not write to Monarch. Prints intended balance updates + intended payment transactions.
 - `--dry-run-check-monarch`: Only meaningful with `--dry-run`. Logs into Monarch **read-only** and prints `SKIP (duplicate)` vs `CREATE` using the duplicate guard (**date + amount + merchant**).
 - `--headful`: Run Playwright with a visible browser window (useful for debugging / monitoring).
@@ -341,5 +340,5 @@ Run `-h` at any time to see the full help:
 - `--payments-since`: Only consider payments on/after this date (`YYYY-MM-DD`). Also used to stop scanning older payment history early (faster runs).
 
 #### `list-monarch-accounts` flags
-- `--config`: Path to YAML config (default: `config.yaml`).
+- `--config`: Path to YAML config (optional; default: `config.yaml` if you use one).
 

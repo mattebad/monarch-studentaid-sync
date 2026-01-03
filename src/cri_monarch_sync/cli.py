@@ -782,7 +782,7 @@ async def _setup_monarch_accounts(
     """
     groups = [normalize_group(m.group) for m in cfg.loans if normalize_group(m.group)]
     if not groups:
-        raise SystemExit("No loans configured. Add loan groups to config.yaml under 'loans:'")
+        raise SystemExit("No loans configured. Set LOAN_GROUPS in .env (recommended), or add loan groups under 'loans:' in a YAML config.")
 
     provider = (cfg.servicer.provider or "servicer").strip().lower()
     mapping_path = Path(out_path) if out_path else default_mapping_path(provider)
