@@ -5,6 +5,7 @@ import asyncio
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 from typing import List, Optional
 
@@ -180,6 +181,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         provider = (cfg.servicer.provider or "servicer").strip().lower()
         try:
+            t0 = time.time()
             if args.manual_mfa and not args.headful:
                 raise SystemExit("--manual-mfa requires --headful (you must be able to interact with the browser).")
             if args.print_mfa_code and not args.headful:
@@ -210,6 +212,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
             state = StateStore(cfg.state.db_path)
             run_id = state.record_run_start()
+            logger.info("Run started (run_id=%s provider=%s groups=%s)", run_id, provider, ",".join(groups))
             try:
                 # Persist browser session per-provider so switching servicers doesn't reuse stale cookies.
                 if not is_known_provider(provider):
@@ -226,6 +229,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
                 mfa_provider = lambda: poll_gmail_imap_for_code(cfg.gmail_imap, print_code=args.print_mfa_code)
 
+                t_portal = time.time()
                 loan_snapshots, payment_allocations = portal.extract(
                     groups=groups,
                     headless=not args.headful,
@@ -240,6 +244,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     step_delay_ms=args.step_delay_ms,
                     manual_mfa=args.manual_mfa,
                 )
+                logger.info("Portal extract complete (seconds=%.2f)", time.time() - t_portal)
 
                 # Safety: keep filtering here too, even though extraction now stops scanning older payments early.
                 if cutoff:
@@ -253,12 +258,16 @@ def main(argv: Optional[List[str]] = None) -> int:
 
                 if args.dry_run:
                     if args.dry_run_check_monarch:
+                        t_monarch = time.time()
                         asyncio.run(_log_dry_run_with_monarch(cfg, state, loan_snapshots, payment_allocations))
+                        logger.info("Dry-run Monarch check complete (seconds=%.2f)", time.time() - t_monarch)
                     else:
                         _log_dry_run(cfg, state, loan_snapshots, payment_allocations)
                     state.record_run_finish(run_id, ok=True, message="dry-run")
+                    logger.info("Run finished (run_id=%s ok=true seconds=%.2f)", run_id, time.time() - t0)
                     return 0
 
+                t_monarch = time.time()
                 asyncio.run(
                     _apply_monarch_updates(
                         cfg,
@@ -268,10 +277,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                         auto_setup_accounts=bool(args.auto_setup_accounts),
                     )
                 )
+                logger.info("Monarch updates complete (seconds=%.2f)", time.time() - t_monarch)
                 state.record_run_finish(run_id, ok=True)
+                logger.info("Run finished (run_id=%s ok=true seconds=%.2f)", run_id, time.time() - t0)
                 return 0
             except Exception as e:
                 state.record_run_finish(run_id, ok=False, message=str(e))
+                logger.error("Run failed (run_id=%s ok=false seconds=%.2f)", run_id, time.time() - t0)
                 raise
             finally:
                 state.close()
@@ -515,6 +527,9 @@ async def _log_dry_run_with_monarch(cfg, state: StateStore, loan_snapshots, paym
             posted_date_iso=alloc.payment_date.isoformat(),
             amount_cents=amount_cents,
             merchant_name=merchant_name,
+            search=(alloc.payment_reference or "").strip()
+            if getattr(cfg.monarch, "duplicate_guard_use_reference", False)
+            else "",
         )
         if dup:
             would_skip_dup += 1
@@ -931,8 +946,9 @@ async def _apply_monarch_updates(
         if state.has_processed_payment(key):
             continue
 
+        ref_part = f" Ref={alloc.payment_reference}" if alloc.payment_reference else ""
         memo = (
-            f"{provider_disp} payment allocation. TotalPayment={cents_to_money_str(alloc.payment_total_cents)} "
+            f"{provider_disp} payment allocation.{ref_part} TotalPayment={cents_to_money_str(alloc.payment_total_cents)} "
             f"Principal={cents_to_money_str(alloc.principal_applied_cents)} "
             f"Interest={cents_to_money_str(alloc.interest_applied_cents)}"
         )
@@ -950,6 +966,9 @@ async def _apply_monarch_updates(
             posted_date_iso=alloc.payment_date.isoformat(),
             amount_cents=amount_cents,
             merchant_name=merchant_name,
+            search=(alloc.payment_reference or "").strip()
+            if getattr(cfg.monarch, "duplicate_guard_use_reference", False)
+            else "",
         )
         if dup:
             logger.info(
