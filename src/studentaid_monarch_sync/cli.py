@@ -10,8 +10,8 @@ from typing import List, Optional
 
 from dotenv import load_dotenv
 
-from .cri.client import PortalCredentials, ServicerPortalClient
-from .cri.mfa import poll_gmail_imap_for_code
+from .portal.client import PortalCredentials, ServicerPortalClient
+from .portal.mfa import poll_gmail_imap_for_code
 from .config import load_config
 from .logging_config import configure_logging
 from .monarch.client import MonarchClient
@@ -218,13 +218,6 @@ def main(argv: Optional[List[str]] = None) -> int:
                         provider,
                     )
                 storage_state_path = f"data/servicer_storage_state_{provider}.json"
-                # Backward compatibility: older versions used `data/cri_storage_state.json`.
-                if (
-                    provider == "cri"
-                    and not Path(storage_state_path).exists()
-                    and Path("data/cri_storage_state.json").exists()
-                ):
-                    storage_state_path = "data/cri_storage_state.json"
 
                 portal = ServicerPortalClient(
                     base_url=cfg.servicer.base_url,
@@ -926,6 +919,7 @@ async def _apply_monarch_updates(
         state.set_last_balance_date(snap.group, today)
 
     # 2) Payment transactions (idempotent)
+    provider_disp = _servicer_display_name((cfg.servicer.provider or "").strip().lower()) or "Servicer"
     merchant_name = cfg.monarch.payment_merchant_name or "Student Loan Payment"
     for alloc in payment_allocations:
         acct_id = group_to_account_id.get(alloc.group)
@@ -938,7 +932,7 @@ async def _apply_monarch_updates(
             continue
 
         memo = (
-            f"CRI payment allocation. TotalPayment={cents_to_money_str(alloc.payment_total_cents)} "
+            f"{provider_disp} payment allocation. TotalPayment={cents_to_money_str(alloc.payment_total_cents)} "
             f"Principal={cents_to_money_str(alloc.principal_applied_cents)} "
             f"Interest={cents_to_money_str(alloc.interest_applied_cents)}"
         )

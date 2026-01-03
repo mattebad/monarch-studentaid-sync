@@ -27,10 +27,10 @@ def test_render_loan_account_name_template() -> None:
         render_loan_account_name(
             "{provider_upper}-{group}",
             group="AB",
-            provider="cri",
-            provider_display="Central Research, Inc. (CRI)",
+            provider="nelnet",
+            provider_display="Nelnet",
         )
-        == "CRI-AB"
+        == "NELNET-AB"
     )
 
 

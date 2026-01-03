@@ -1,6 +1,6 @@
 servicer:
   # Provider slug (usually matches the subdomain in `https://{provider}.studentaid.gov`)
-  # Examples: cri, nelnet, mohela, edfinancial, aidvantage
+  # Examples: nelnet, mohela, edfinancial, aidvantage
   provider: "${SERVICER_PROVIDER}"
   # Optional override if your portal does not match the standard pattern.
   # If unset/empty, we default to `https://{provider}.studentaid.gov`.

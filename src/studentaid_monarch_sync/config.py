@@ -36,7 +36,7 @@ def _derive_provider_from_base_url(base_url: str) -> str:
     host = (parsed.netloc or parsed.path or "").strip().lower()
     if ":" in host:
         host = host.split(":", 1)[0]
-    # e.g. "cri.studentaid.gov" -> "cri"
+    # e.g. "nelnet.studentaid.gov" -> "nelnet"
     if "." in host:
         return host.split(".", 1)[0]
     return host
@@ -163,7 +163,7 @@ class ServicerConfig(BaseModel):
             provider = _derive_provider_from_base_url(base_url)
 
         if not provider:
-            raise ValueError("servicer.provider is required (e.g. 'cri', 'nelnet', 'mohela')")
+            raise ValueError("servicer.provider is required (e.g. 'nelnet', 'mohela', 'aidvantage')")
         if not _PROVIDER_SLUG_RE.match(provider):
             raise ValueError(
                 "servicer.provider must be a slug like 'nelnet' (lowercase letters, numbers, hyphen only)"
@@ -247,21 +247,7 @@ class AppConfig(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def _migrate_legacy_keys(cls, data: object) -> object:
-        """
-        Backward compatibility:
-        - Older configs used a top-level `cri:` block.
-        - New configs use `servicer:` + `servicer.provider`.
-        """
-        if not isinstance(data, dict):
-            return data
-
-        if "servicer" not in data and "cri" in data and isinstance(data["cri"], dict):
-            legacy = dict(data["cri"])
-            legacy.setdefault("provider", "cri")
-            out = dict(data)
-            out["servicer"] = legacy
-            return out
-
+        # No legacy migrations currently; keep hook for future compatibility if needed.
         return data
 
 def load_config(path: Union[str, Path]) -> AppConfig:
@@ -270,14 +256,6 @@ def load_config(path: Union[str, Path]) -> AppConfig:
     if p.exists():
         raw = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
         raw = _expand_env_vars(raw)  # supports ${ENV_VAR} in YAML
-
-    # Apply legacy migrations BEFORE merging in env defaults, so the presence of default keys
-    # doesn't prevent the migration logic from running.
-    if isinstance(raw, dict) and "servicer" not in raw and "cri" in raw and isinstance(raw.get("cri"), dict):
-        legacy = dict(raw["cri"])
-        legacy.setdefault("provider", "cri")
-        raw = dict(raw)
-        raw["servicer"] = legacy
 
     merged = _deep_merge(_default_config_from_env(), raw)
     cfg = AppConfig.model_validate(merged)

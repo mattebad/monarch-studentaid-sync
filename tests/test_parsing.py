@@ -4,7 +4,7 @@ from datetime import date
 
 import pytest
 
-from studentaid_monarch_sync.cri.client import PortalCredentials, ServicerPortalClient
+from studentaid_monarch_sync.portal.client import PortalCredentials, ServicerPortalClient
 from studentaid_monarch_sync.util.dates import parse_us_date
 
 

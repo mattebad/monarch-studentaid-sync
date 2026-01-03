@@ -15,7 +15,7 @@ class ServicerInfo:
 KNOWN_SERVICERS: Mapping[str, ServicerInfo] = {
     # Common current servicers (subdomain pattern: https://{provider}.studentaid.gov)
     "aidvantage": ServicerInfo(provider="aidvantage", display_name="Aidvantage"),
-    "cri": ServicerInfo(provider="cri", display_name="Central Research, Inc. (CRI)"),
+    "cri": ServicerInfo(provider="cri", display_name="Central Research, Inc."),
     "edfinancial": ServicerInfo(provider="edfinancial", display_name="Edfinancial"),
     "mohela": ServicerInfo(provider="mohela", display_name="MOHELA"),
     "nelnet": ServicerInfo(provider="nelnet", display_name="Nelnet"),

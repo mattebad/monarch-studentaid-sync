@@ -259,9 +259,9 @@ This makes MFA automation reliable and keeps old/stale codes out of your inbox.
     - (Optional) **Never send it to Spam**
 
 - **Recommended `.env` values**
-  - **`GMAIL_IMAP_SENDER_HINT`**: `studentaid.gov` (or a specific one like `cri.studentaid.gov`)
+  - **`GMAIL_IMAP_SENDER_HINT`**: `studentaid.gov` (or a specific one like `<provider>.studentaid.gov`)
   - **`GMAIL_IMAP_SUBJECT_HINT`**: `code` (broad; subjects vary by servicer)
-  - Example sender we’ve seen: `CRINoReply@cri.studentaid.gov`
+  - Example sender we’ve seen: `NoReply@<provider>.studentaid.gov`
     - Other servicers are likely similar (`<something>@<provider>.studentaid.gov`), but we don’t rely on that—use the hints above.
 
 ### Dry-run that ALSO checks Monarch (recommended)

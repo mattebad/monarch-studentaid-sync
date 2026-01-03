@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 
-from studentaid_monarch_sync.cri.mfa import _extract_code, _strip_html_to_text
+from studentaid_monarch_sync.portal.mfa import _extract_code, _strip_html_to_text
 
 
 def test_strip_html_to_text_removes_style_and_tags_and_unescapes() -> None:

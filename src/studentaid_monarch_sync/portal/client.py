@@ -36,9 +36,7 @@ class PortalCredentials:
 
 class ServicerPortalClient:
     """
-    StudentAid servicer portal automation (e.g. `https://cri.studentaid.gov`, `https://nelnet.studentaid.gov`).
-
-    Implemented fully in the `cri-extract` + `gmail-mfa` todos.
+    StudentAid servicer portal automation (typically `https://{provider}.studentaid.gov`).
     """
 
     def __init__(
@@ -155,7 +153,7 @@ class ServicerPortalClient:
             try:
                 # Attempt 1: reuse stored session (unless force_fresh_session).
                 # Attempt 2: fresh session (no stored cookies) — helpful when stored state causes
-                # redirects to the `dark.cri...` host or other weird edge cases.
+                # weird redirects (e.g. `dark.<provider>.studentaid.gov`) or other edge cases.
                 attempts = 1 if force_fresh_session else 2
 
                 for attempt_idx in range(attempts):
@@ -1416,6 +1414,3 @@ class ServicerPortalClient:
                 pass
 
 
-# Backward-compatible aliases (older code used CRI-specific names).
-CriCredentials = PortalCredentials
-CriClient = ServicerPortalClient
