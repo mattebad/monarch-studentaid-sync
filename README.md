@@ -49,6 +49,23 @@ Tip: list common provider slugs (non-exhaustive):
 docker compose run --rm --build studentaid-monarch-sync list-servicers
 ```
 
+#### One-time setup (required): map your loan groups to Monarch accounts 🧾
+Before the first real sync, run this **once** to create/map **one Monarch manual account per loan group** and save a stable mapping under `data/` (so later account renames won’t break anything).
+
+- **Docker (recommended)**:
+
+```bash
+docker compose run --rm --build studentaid-monarch-sync setup-monarch-accounts --apply
+```
+
+- **Python**:
+
+```bash
+.venv\Scripts\python -m studentaid_monarch_sync setup-monarch-accounts --apply
+```
+
+After this, your scheduled runs can just execute `sync`.
+
 
 #### Choose your runtime 🧭
 Pick **one** of the following and run it end-to-end. For most people (especially NAS/Unraid), **Docker is the recommended option** 🐳✅
@@ -64,26 +81,19 @@ This repo includes a `docker-compose.yml` service that runs the sync as a **run-
 mkdir data
 ```
 
-3. One-time: set up your Monarch loan accounts (no manual account ID copying) 🧾
-This will map (and create if needed) **one Monarch manual account per loan group**, and store a stable mapping under `data/` so renaming accounts later won’t break anything.
-
-```bash
-docker compose run --rm --build studentaid-monarch-sync setup-monarch-accounts --apply
-```
-
-4. Preflight (inside the container):
+3. Preflight (inside the container):
 
 ```bash
 docker compose run --rm --build studentaid-monarch-sync preflight
 ```
 
-5. Dry-run:
+4. Dry-run:
 
 ```bash
 docker compose run --rm studentaid-monarch-sync sync --dry-run --payments-since 2025-01-01
 ```
 
-6. Run for real (writes to Monarch):
+5. Run for real (writes to Monarch):
 
 ```bash
 docker compose run --rm studentaid-monarch-sync sync --payments-since 2025-01-01
@@ -161,13 +171,6 @@ python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 .venv/bin/python -m pip install -e .
 .venv/bin/python -m playwright install chromium
-```
-
-**One-time: set up your Monarch loan accounts (no manual account ID copying) 🧾**
-This will map (and create if needed) **one Monarch manual account per loan group**, and store a stable mapping under `data/` so renaming accounts later won’t break anything.
-
-```bash
-.venv\Scripts\python -m studentaid_monarch_sync setup-monarch-accounts --apply
 ```
 
 **Preflight (fast fail, no Playwright) ⚡**
