@@ -998,7 +998,9 @@ class ServicerPortalClient:
         start = start_match.start()
         remainder = full_text[start_match.end() :]
 
-        next_match = re.search(r"\n\s*Group:\s*[A-Z]{2}\b", remainder)
+        # Group codes are typically AA/AB/etc, but keep this aligned with config/env validation (2-8 A-Z/0-9)
+        # so we don't accidentally slice multiple groups together when a servicer uses a different format.
+        next_match = re.search(r"\n\s*Group:\s*[A-Z0-9]{2,8}\b", remainder)
         end = start_match.end() + next_match.start() if next_match else len(full_text)
 
         return full_text[start:end]
@@ -1254,7 +1256,7 @@ class ServicerPortalClient:
         for ln in lines:
             # Group rows like: \"AA  $31.20  $19.78  $11.42\"
             m = re.match(
-                r"^([A-Z]{2})\s+\$?([\d,]+\.\d{2})\s+\$?([\d,]+\.\d{2})\s+\$?([\d,]+\.\d{2})\s*$",
+                r"^([A-Z0-9]{2,8})\s+\$?([\d,]+\.\d{2})\s+\$?([\d,]+\.\d{2})\s+\$?([\d,]+\.\d{2})\s*$",
                 ln,
             )
             if m:
@@ -1381,6 +1383,11 @@ class ServicerPortalClient:
             out_dir.mkdir(parents=True, exist_ok=True)
             page.screenshot(path=str(out_dir / f"{name_prefix}.png"), full_page=True)
             (out_dir / f"{name_prefix}.html").write_text(page.content(), encoding="utf-8")
+            # Also save the rendered body text so parsing can be debugged offline without DOM tooling.
+            try:
+                (out_dir / f"{name_prefix}.txt").write_text(page.inner_text("body"), encoding="utf-8")
+            except Exception:
+                pass
         except Exception:
             logger.debug("Failed to save debug artifacts.", exc_info=True)
 
