@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from cri_monarch_sync.config import load_config
+from studentaid_monarch_sync.config import load_config
 
 
 def test_loan_groups_can_come_from_env(tmp_path, monkeypatch) -> None:

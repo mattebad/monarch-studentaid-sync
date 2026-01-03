@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from cri_monarch_sync.state import StateStore
+from studentaid_monarch_sync.state import StateStore
 
 
 def test_state_creates_backup(tmp_path: Path) -> None:

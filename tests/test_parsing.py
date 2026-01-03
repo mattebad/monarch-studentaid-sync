@@ -4,8 +4,8 @@ from datetime import date
 
 import pytest
 
-from cri_monarch_sync.cri.client import PortalCredentials, ServicerPortalClient
-from cri_monarch_sync.util.dates import parse_us_date
+from studentaid_monarch_sync.cri.client import PortalCredentials, ServicerPortalClient
+from studentaid_monarch_sync.util.dates import parse_us_date
 
 
 def _client() -> ServicerPortalClient:

@@ -3,7 +3,7 @@ from __future__ import annotations
 import zipfile
 from pathlib import Path
 
-from cri_monarch_sync.util.debug_bundle import create_debug_bundle
+from studentaid_monarch_sync.util.debug_bundle import create_debug_bundle
 
 
 def test_create_debug_bundle_includes_debug_and_log(tmp_path: Path) -> None:

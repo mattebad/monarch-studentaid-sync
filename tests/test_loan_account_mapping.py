@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from cri_monarch_sync.monarch.loan_accounts import (
+from studentaid_monarch_sync.monarch.loan_accounts import (
     LoanAccountMapping,
     candidate_loan_account_names,
     find_exact_name_matches,

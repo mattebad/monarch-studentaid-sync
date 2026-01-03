@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from cri_monarch_sync.config import _derive_provider_from_base_url, load_config
+from studentaid_monarch_sync.config import _derive_provider_from_base_url, load_config
 
 
 def _write(tmp_path: Path, name: str, text: str) -> Path:
