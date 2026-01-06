@@ -197,6 +197,10 @@ def _try_fetch_code_once(
             return code
 
         return None
+    except Exception:
+        # Treat transient IMAP parsing/search issues as "no code yet"; caller will retry.
+        logger.debug("IMAP fetch attempt failed; treating as no-code.", exc_info=True)
+        return None
 
 
 def _extract_best_effort_body(msg: Message) -> str:

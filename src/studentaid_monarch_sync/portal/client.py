@@ -246,6 +246,180 @@ class ServicerPortalClient:
             finally:
                 browser.close()
 
+    def discover_loan_groups(
+        self,
+        *,
+        headless: bool = True,
+        storage_state_path: str = "data/servicer_storage_state.json",
+        debug_dir: str = "data/debug",
+        mfa_code_provider: Optional[Callable[[], str]] = None,
+        mfa_method: str = "email",
+        force_fresh_session: bool = False,
+        slow_mo_ms: int = 0,
+        step_debug: bool = False,
+        step_delay_ms: int = 0,
+        manual_mfa: bool = False,
+    ) -> list[tuple[str, str]]:
+        """
+        Log into the servicer portal and return discovered loan groups.
+
+        Returns: list of (group_token, group_label)
+        - group_token: short ID suitable for LOAN_GROUPS (e.g. "AA", "1-01") when parseable
+        - group_label: raw label after "Group:" (may include extra words)
+        """
+        # Configure per-run step debug behavior.
+        self._step_debug_enabled = step_debug
+        self._step_counter = 0
+        self._step_delay_ms = int(step_delay_ms or 0)
+
+        state_path = Path(storage_state_path) if storage_state_path else None
+        Path(debug_dir).mkdir(parents=True, exist_ok=True)
+
+        def _install_context_hooks(ctx) -> None:
+            # Keep behavior consistent with `extract()`.
+            try:
+                if not self._dark_host or not self._canonical_host:
+                    raise RuntimeError("canonical host missing")
+
+                def _rewrite(route, request) -> None:
+                    url = request.url
+                    fixed = url.replace(f"://{self._dark_host}", f"://{self._canonical_host}")
+                    route.continue_(url=fixed)
+
+                ctx.route(
+                    re.compile(rf".*://{re.escape(self._dark_host)}/.*", re.I),
+                    _rewrite,
+                )
+            except Exception:
+                logger.debug("Failed to install dark-host rewrite route.", exc_info=True)
+
+            ctx.add_init_script(
+                """
+                (() => {
+                  const dismiss = () => {
+                    try {
+                      const accept = Array.from(document.querySelectorAll('button'))
+                        .find(b => /accept\\s+all/i.test((b.textContent || '').trim()));
+                      if (accept && /this\\s+site\\s+uses\\s+cookies/i.test(document.body?.innerText || '')) {
+                        accept.click();
+                      }
+                    } catch (_) {}
+
+                    try {
+                      const host = document.getElementById('transcend-consent-manager');
+                      const root = host && host.shadowRoot;
+                      if (root) {
+                        const accept = Array.from(root.querySelectorAll('button'))
+                          .find(b => /accept\\s+all/i.test((b.textContent || '').trim()));
+                        if (accept) accept.click();
+                      }
+                    } catch (_) {}
+
+                    try {
+                      const host = document.getElementById('transcend-consent-manager');
+                      if (host) {
+                        host.style.setProperty('display', 'none', 'important');
+                        host.style.setProperty('pointer-events', 'none', 'important');
+                      }
+                    } catch (_) {}
+                  };
+
+                  try {
+                    const observer = new MutationObserver(() => dismiss());
+                    observer.observe(document.documentElement, { childList: true, subtree: true });
+                    dismiss();
+                  } catch (_) {}
+                })();
+                """
+            )
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=headless, slow_mo=slow_mo_ms)
+            try:
+                for attempt_idx in range(2):
+                    use_storage = (
+                        attempt_idx == 0 and not force_fresh_session and state_path is not None and state_path.exists()
+                    )
+                    if use_storage and state_path is not None:
+                        use_storage = self._validate_or_restore_storage_state(state_path)
+
+                    ctx_kwargs: dict = {}
+                    if use_storage:
+                        ctx_kwargs["storage_state"] = str(state_path)
+                    ctx_kwargs["color_scheme"] = "light"
+
+                    ctx = None
+                    try:
+                        ctx = browser.new_context(**ctx_kwargs)
+                    except Exception as e:
+                        if use_storage and state_path is not None:
+                            logger.warning(
+                                "Failed to create browser context with stored session; falling back to fresh session. (%s)",
+                                e,
+                            )
+                            self._quarantine_file(state_path, prefix="storage_state")
+                            ctx_kwargs.pop("storage_state", None)
+                            use_storage = False
+                            ctx = browser.new_context(**ctx_kwargs)
+                        else:
+                            raise
+
+                    _install_context_hooks(ctx)
+
+                    page = ctx.new_page()
+                    try:
+                        self._step(page, debug_dir=debug_dir, name=f"discover_start_attempt_{attempt_idx+1}")
+                        self._login(
+                            page,
+                            mfa_code_provider=mfa_code_provider,
+                            mfa_method=mfa_method,
+                            debug_dir=debug_dir,
+                            manual_mfa=manual_mfa,
+                        )
+
+                        if state_path is not None:
+                            state_path.parent.mkdir(parents=True, exist_ok=True)
+                            ctx.storage_state(path=str(state_path))
+                            self._backup_storage_state(state_path)
+
+                        # Navigate to loan details and parse "Group:" headers.
+                        self._wait_for_post_login_ready(page, debug_dir=debug_dir, timeout_ms=90_000)
+                        self._goto_section(page, self.selectors.nav_my_loans_text, debug_dir=debug_dir)
+
+                        if not self._wait_for_body_text_contains(page, "Group:", timeout_ms=30_000):
+                            self._save_debug(page, debug_dir=debug_dir, name_prefix="discover_groups_not_loaded")
+                            raise RuntimeError("Loan details page did not load (missing 'Group:' sections).")
+
+                        body = page.inner_text("body")
+                        sections = self._extract_all_group_sections(body)
+                        groups: list[tuple[str, str]] = []
+                        seen: set[str] = set()
+                        for token, label, _ in sections:
+                            key = token or label
+                            if not key or key in seen:
+                                continue
+                            groups.append((token, label))
+                            seen.add(key)
+                        return groups
+                    except Exception as e:
+                        if attempt_idx == 0 and not force_fresh_session:
+                            retry_for_browser_error = self._looks_like_browser_error(page)
+                            retry_for_login_form = (
+                                use_storage and isinstance(e, LoginFormNotFoundError) and not self._looks_logged_in(page)
+                            )
+                            if retry_for_browser_error or retry_for_login_form:
+                                logger.warning(
+                                    "Portal navigation/login failed%s; retrying once with a fresh session (no stored cookies).",
+                                    " (stored session)" if use_storage else "",
+                                )
+                                self._save_debug(page, debug_dir=debug_dir, name_prefix="discover_retry_fresh_session")
+                                continue
+                        raise
+                    finally:
+                        ctx.close()
+            finally:
+                browser.close()
+
     def _storage_state_backup_path(self, state_path: Path) -> Path:
         # e.g. data/servicer_storage_state_nelnet.json -> data/servicer_storage_state_nelnet.json.bak
         return state_path.with_name(state_path.name + ".bak")
@@ -973,34 +1147,126 @@ class ServicerPortalClient:
         # Instead, slice the page text per-group and parse within that slice.
         full_text = page.inner_text("body")
 
+        sections = self._extract_all_group_sections(full_text)
+        if not sections:
+            self._save_debug(page, debug_dir=debug_dir, name_prefix="loan_details_no_groups_found")
+            raise RuntimeError("Could not find any 'Group:' sections on the loan details page.")
+
         out: list[LoanSnapshot] = []
         for group in groups:
             try:
                 self._step(page, debug_dir=debug_dir, name=f"loans_before_parse_group_{group}")
-                group_text = self._extract_group_section_text(full_text, group=group)
+                group_text = self._match_group_section_text(sections, group=group)
                 out.append(self._parse_loan_snapshot(group=group, body_text=group_text))
             except Exception:
                 self._save_debug(page, debug_dir=debug_dir, name_prefix=f"loan_{group}_error")
                 raise
         return out
 
+    def _extract_all_group_sections(self, full_text: str) -> list[tuple[str, str, str]]:
+        """
+        Return a list of discovered group sections from the loan-details page.
+
+        Each item is a tuple: (group_token, group_label, section_text)
+        - group_label: the raw text after "Group:" on the header line
+        - group_token: a short ID parsed from the start of group_label (e.g. "AA", "1-01") when possible
+
+        Notes:
+        - Servicers are not consistent about group label formats. We avoid hardcoding AA/AB assumptions.
+        - group_token is best-effort and may be empty if we can't parse a token.
+        """
+        # Find every "Group:" header and slice to the next header (or end of text).
+        matches = list(re.finditer(r"Group:\s*([^\n\r]+)", full_text, flags=re.I))
+        if not matches:
+            return []
+
+        out: list[tuple[str, str, str]] = []
+        for i, m in enumerate(matches):
+            start = m.start()
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(full_text)
+            section_text = full_text[start:end]
+
+            label = (m.group(1) or "").strip()
+            tok_m = re.match(r"([A-Z0-9][A-Z0-9-]{1,31})", label, flags=re.I)
+            token = tok_m.group(1).upper() if tok_m else ""
+
+            out.append((token, label, section_text))
+        return out
+
+    def _match_group_section_text(self, sections: list[tuple[str, str, str]], *, group: str) -> str:
+        """
+        Resolve a configured group ID to a discovered section_text.
+
+        Matching strategy:
+        1) token match (configured group == parsed token)
+        2) prefix match (group_label startswith configured group)
+        3) raw label match (configured group == group_label)
+        """
+        g = (group or "").strip()
+        if not g:
+            raise RuntimeError("Empty loan group provided.")
+
+        g_up = g.upper()
+
+        # 1) exact token match
+        for token, label, section_text in sections:
+            if token and token.upper() == g_up:
+                return section_text
+
+        # 2) label prefix match (covers cases like "Group: 1-01 Direct Loan - Subsidized" with group="1-01")
+        for token, label, section_text in sections:
+            if (label or "").strip().upper().startswith(g_up):
+                return section_text
+
+        # 3) raw label match (fallback)
+        for token, label, section_text in sections:
+            if (label or "").strip().upper() == g_up:
+                return section_text
+
+        # Not found: build a helpful error with discovered groups.
+        discovered_tokens = [t for (t, _, _) in sections if t]
+        # De-dupe but preserve order
+        seen: set[str] = set()
+        tokens = []
+        for t in discovered_tokens:
+            if t in seen:
+                continue
+            tokens.append(t)
+            seen.add(t)
+
+        labels = [lbl for (_, lbl, _) in sections if (lbl or "").strip()]
+        labels = labels[:12]  # keep error readable
+
+        hint = ""
+        if tokens:
+            hint = f" Discovered group IDs: {', '.join(tokens)}."
+        elif labels:
+            hint = f" Discovered group labels: {', '.join(labels)}."
+
+        raise RuntimeError(
+            f"Could not locate a loan group section for group={group!r}.{hint} "
+            "Tip: run `studentaid_monarch_sync list-loan-groups` to print a copy/paste LOAN_GROUPS value."
+        )
+
     def _extract_group_section_text(self, full_text: str, *, group: str) -> str:
         """
         Extract the text for a single loan group from the "My Loans" page.
 
-        The UI renders each group section with a header like "Group: AA". We slice from that
-        header to the next "Group:" header (or end of text).
+        The UI renders each group section with a header like "Group: AA" (some servicers
+        include longer identifiers, e.g. "Group: 1-01 Direct Loan - Subsidized").
+        We slice from that header to the next "Group:" header (or end of text).
         """
-        start_match = re.search(rf"Group:\s*{re.escape(group)}\b", full_text)
+        # Case-insensitive: some portals may render labels with mixed case, while config/env
+        # normalization may uppercase tokens.
+        start_match = re.search(rf"Group:\s*{re.escape(group)}\b", full_text, flags=re.I)
         if not start_match:
             raise RuntimeError(f"Could not locate group section header for group={group}")
 
         start = start_match.start()
         remainder = full_text[start_match.end() :]
 
-        # Group codes are typically AA/AB/etc, but keep this aligned with config/env validation (2-8 A-Z/0-9)
-        # so we don't accidentally slice multiple groups together when a servicer uses a different format.
-        next_match = re.search(r"\n\s*Group:\s*[A-Z0-9]{2,8}\b", remainder)
+        # Find the next group header. Do not assume a specific ID format; servicers vary.
+        next_match = re.search(r"\n\s*Group:\s*", remainder, flags=re.I)
         end = start_match.end() + next_match.start() if next_match else len(full_text)
 
         return full_text[start:end]
@@ -1256,11 +1522,11 @@ class ServicerPortalClient:
         for ln in lines:
             # Group rows like: \"AA  $31.20  $19.78  $11.42\"
             m = re.match(
-                r"^([A-Z0-9]{2,8})\s+\$?([\d,]+\.\d{2})\s+\$?([\d,]+\.\d{2})\s+\$?([\d,]+\.\d{2})\s*$",
+                r"^([A-Z0-9][A-Z0-9-]{1,31})\s+\$?([\d,]+\.\d{2})\s+\$?([\d,]+\.\d{2})\s+\$?([\d,]+\.\d{2})\s*$",
                 ln,
             )
             if m:
-                group = m.group(1)
+                group = m.group(1).upper()
                 total_applied = money_to_cents(m.group(2))
                 principal = money_to_cents(m.group(3))
                 interest = money_to_cents(m.group(4))

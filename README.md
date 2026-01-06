@@ -1,7 +1,7 @@
 ## Monarch Student Loan Sync 🧾✨
 
 This project automates (so you don’t have to click through portals every day):
-- **Daily balance updates** for each loan group (AA/AB/…)
+- **Daily balance updates** for each loan group (AA/AB/1-01/…)
 - **Payment-posted transactions** in Monarch (one per loan group allocation), categorized as **Transfer**
 
 It’s designed to run **unattended** (Docker/Unraid), with **email MFA** handled via **Gmail IMAP + App Password**. 🤖📬
@@ -15,7 +15,7 @@ This guide is linear: **Prereqs → Configure → Choose a runtime (Python or Do
 At a high level, each scheduled run:
 - Logs into your StudentAid servicer portal with Playwright 🔐
 - Handles MFA via email (Gmail IMAP) when prompted 📬
-- Scrapes current **balances** per loan group (AA/AB/…) and recent **payment allocations**
+- Scrapes current **balances** per loan group (AA/AB/1-01/…) and recent **payment allocations**
 - Updates Monarch:
   - **Balances**: updates your mapped manual accounts
   - **Payments**: creates transactions (one per allocation) ✅
@@ -36,12 +36,24 @@ Copy `env.example` → `.env` and fill in values (Monarch + Gmail IMAP + your lo
 
 Required:
 - `SERVICER_PROVIDER`, `SERVICER_USERNAME`, `SERVICER_PASSWORD`
-- `LOAN_GROUPS` (comma-separated: `AA,AB,...`)
+- `LOAN_GROUPS` (comma-separated: `AA,AB,...` or `1-01,1-02,...`)
 - Monarch auth (`MONARCH_TOKEN` or `MONARCH_EMAIL` + `MONARCH_PASSWORD`)
 - Gmail IMAP (`GMAIL_IMAP_USER` + `GMAIL_IMAP_APP_PASSWORD`)
 
 Advanced (optional):
 - `config.example.yaml` is an advanced override file. You can pass `--config config.example.yaml`, but most users don’t need YAML at all.
+
+Tip: If you’re not sure what to put in `LOAN_GROUPS`, you can have the tool log into your servicer portal and list what it discovers:
+
+```bash
+docker compose run --rm --build studentaid-monarch-sync list-loan-groups
+```
+
+or (Python):
+
+```bash
+.venv/bin/python -m studentaid_monarch_sync list-loan-groups --headful
+```
 
 Tip: list common provider slugs (non-exhaustive):
 
@@ -171,6 +183,12 @@ python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 .venv/bin/python -m pip install -e .
 .venv/bin/python -m playwright install chromium
+```
+
+**(Optional) Run unit tests 🧪**
+
+```bash
+.venv/bin/python -m pytest -q
 ```
 
 **Preflight (fast fail, no Playwright) ⚡**

@@ -65,6 +65,22 @@ def test_parse_payment_allocations_parses_groups_and_total_and_reference() -> No
     assert aa.interest_applied_cents == 1098
 
 
+def test_parse_payment_allocations_supports_hyphenated_group_ids() -> None:
+    c = _client()
+    body = """
+    Payment Date: 12/26/2025
+
+    1-01  $31.20  $20.22  $10.98
+    1-02  $16.99  $10.61  $6.38
+    Total $48.19 $30.83 $17.36
+    """
+
+    allocs = c._parse_payment_allocations(body)
+    assert len(allocs) == 2
+    assert {a.group for a in allocs} == {"1-01", "1-02"}
+    assert all(a.payment_total_cents == 4819 for a in allocs)
+
+
 def test_parse_payment_allocations_falls_back_to_sum_when_total_missing() -> None:
     c = _client()
     body = """

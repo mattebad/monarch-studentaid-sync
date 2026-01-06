@@ -50,7 +50,7 @@ def main(argv: list[str] | None = None) -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     loans = sub.add_parser("loans", help="Parse a My Loans text snapshot into LoanSnapshot[]")
-    loans.add_argument("--groups", required=True, help="Comma/space separated loan groups (e.g. AA,AB,AC)")
+    loans.add_argument("--groups", required=True, help="Comma/space separated loan groups (e.g. AA,AB,1-01)")
     loans.add_argument("--file", required=True, help="Path to a debug .txt file captured from the loan-details page")
     loans.add_argument("--out", default="", help="Optional output JSON path (otherwise prints to stdout)")
 
