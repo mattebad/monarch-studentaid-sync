@@ -386,9 +386,22 @@ class ServicerPortalClient:
                         self._wait_for_post_login_ready(page, debug_dir=debug_dir, timeout_ms=90_000)
                         self._goto_section(page, self.selectors.nav_my_loans_text, debug_dir=debug_dir)
 
+                        # Some portals expose "My Loans" navigation in a way that isn't reliably clickable by role.
+                        # Mirror the `extract()` behavior: if nav click didn't land us on the loan details view,
+                        # fall back to a direct URL.
+                        if not self._wait_for_body_text_contains(page, "Group:", timeout_ms=15_000):
+                            try:
+                                page.goto(f"{self.base_url}/loan-details", wait_until="domcontentloaded")
+                                self._wait_for_settle(page, timeout_ms=30_000)
+                            except Exception:
+                                # We'll validate below; if still not loaded, we'll raise with debug artifacts.
+                                pass
+
                         if not self._wait_for_body_text_contains(page, "Group:", timeout_ms=30_000):
                             self._save_debug(page, debug_dir=debug_dir, name_prefix="discover_groups_not_loaded")
-                            raise RuntimeError("Loan details page did not load (missing 'Group:' sections).")
+                            raise RuntimeError(
+                                f"Loan details page did not load (missing 'Group:' sections). url={getattr(page, 'url', '')!r}"
+                            )
 
                         body = page.inner_text("body")
                         sections = self._extract_all_group_sections(body)
