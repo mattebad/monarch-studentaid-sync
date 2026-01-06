@@ -642,7 +642,6 @@ class ServicerPortalClient:
             raise RuntimeError(f"browse-portal ended due to error: {err}. Debug bundle: {bundle_path}") from err
 
         return bundle_path  # type: ignore[return-value]
-
     def _storage_state_backup_path(self, state_path: Path) -> Path:
         # e.g. data/servicer_storage_state_nelnet.json -> data/servicer_storage_state_nelnet.json.bak
         return state_path.with_name(state_path.name + ".bak")

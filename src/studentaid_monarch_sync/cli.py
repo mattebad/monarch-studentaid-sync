@@ -212,7 +212,6 @@ def _build_parser() -> argparse.ArgumentParser:
         default="",
         help="Optional directory to write captures (default: auto under data/).",
     )
-
     return p
 
 
