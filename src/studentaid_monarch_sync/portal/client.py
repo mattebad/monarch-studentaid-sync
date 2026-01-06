@@ -386,9 +386,9 @@ class ServicerPortalClient:
                         self._wait_for_post_login_ready(page, debug_dir=debug_dir, timeout_ms=90_000)
                         self._goto_section(page, self.selectors.nav_my_loans_text, debug_dir=debug_dir)
 
-                        # Some portals expose "My Loans" navigation in a way that isn't reliably clickable by role.
-                        # Mirror the `extract()` behavior: if nav click didn't land us on the loan details view,
-                        # fall back to a direct URL.
+                        # Some portals render multiple "My Loans" targets (nav, dashboard cards, footer).
+                        # We try to click the most likely navigation candidate first, but still keep a hard
+                        # fallback: if clicks don't land us on the loan details view, go directly by URL.
                         if not self._wait_for_body_text_contains(page, "Group:", timeout_ms=15_000):
                             try:
                                 page.goto(f"{self.base_url}/loan-details", wait_until="domcontentloaded")
@@ -1622,35 +1622,141 @@ class ServicerPortalClient:
             pass
 
     def _goto_section(self, page: Page, nav_texts: tuple[str, ...], *, debug_dir: str) -> None:
-        # Try link then button for each nav label.
-        for t in nav_texts:
-            try:
-                link = page.get_by_role("link", name=re.compile(re.escape(t), re.I))
-                if link.count() > 0:
-                    link.first.click()
-                    self._wait_for_settle(page)
-                    return
-            except Exception:
-                pass
-            try:
-                btn = page.get_by_role("button", name=re.compile(re.escape(t), re.I))
-                if btn.count() > 0:
-                    btn.first.click()
-                    self._wait_for_settle(page)
-                    return
-            except Exception:
-                pass
+        """
+        Best-effort navigation helper for a SPA.
 
-            # Fallback: for longer labels (avoid generic ones like "Loans"), try clicking by visible text.
-            if len(t) >= 7 or " " in t:
+        Notes:
+        - Portals often render multiple matching elements (header nav, dashboard cards, footer).
+          Clicking `.first` is brittle; we instead try all candidates.
+        - We prefer candidates that look like real navigation targets:
+          elements with `href` or `routerlink` attributes, and ones whose URL contains words
+          from the nav label (e.g. "payment-activity" for "Payment Activity").
+        - Some labels (e.g. "Payments") may be dropdown toggles (no href/routerlink). We'll click them
+          to expand menus, then re-scan for the real destination links.
+        """
+
+        def _label_words(label: str) -> list[str]:
+            # Keep alphanumerics, split on spaces/punct. Drop very short/common words.
+            raw = re.findall(r"[a-z0-9]+", (label or "").casefold())
+            stop = {"the", "and", "or", "my", "a", "an", "to", "of"}
+            return [w for w in raw if len(w) >= 3 and w not in stop]
+
+        def _candidate_score(*, label: str, href: str, routerlink: str, visible: bool) -> int:
+            target = (href or routerlink or "").strip().casefold()
+            score = 0
+            if href:
+                score += 50
+            if routerlink:
+                score += 50
+            if target:
+                for w in _label_words(label):
+                    if w in target:
+                        score += 10
+            if visible:
+                score += 5
+            else:
+                score -= 100
+            return score
+
+        def _try_locator_group(label: str, loc) -> tuple[bool, bool]:
+            """
+            Try clicking all candidates in a locator group.
+            Returns (navigated, clicked_non_nav):
+            - navigated=True if we successfully clicked a candidate with href/routerlink
+            - clicked_non_nav=True if we clicked something without href/routerlink (likely a menu toggle)
+            """
+            try:
+                n = loc.count()
+            except Exception:
+                return False, False
+
+            # Cap to avoid pathological matches in case a label is too generic.
+            n = min(int(n), 25)
+            if n <= 0:
+                return False, False
+
+            candidates: list[tuple[int, object, str, str]] = []
+            for i in range(n):
+                el = loc.nth(i)
+                href = ""
+                routerlink = ""
+                visible = False
                 try:
-                    cand = page.get_by_text(t, exact=False)
-                    if cand.count() > 0:
-                        cand.first.click()
-                        self._wait_for_settle(page)
-                        return
+                    visible = bool(el.is_visible())
                 except Exception:
-                    pass
+                    visible = False
+                try:
+                    href = (el.get_attribute("href") or "").strip()
+                except Exception:
+                    href = ""
+                try:
+                    # Angular uses `routerlink` (lowercase in HTML), but keep this defensive.
+                    routerlink = (el.get_attribute("routerlink") or el.get_attribute("routerLink") or "").strip()
+                except Exception:
+                    routerlink = ""
+
+                score = _candidate_score(label=label, href=href, routerlink=routerlink, visible=visible)
+                candidates.append((score, el, href, routerlink))
+
+            # Highest score first.
+            candidates.sort(key=lambda x: x[0], reverse=True)
+
+            clicked_non_nav = False
+            for score, el, href, routerlink in candidates:
+                try:
+                    if not el.is_visible():
+                        continue
+                    el.scroll_into_view_if_needed(timeout=2_000)
+                    el.click(timeout=5_000)
+                    self._wait_for_settle(page)
+                    if href or routerlink:
+                        logger.debug(
+                            "Navigation click succeeded (label=%r href=%r routerlink=%r score=%s)",
+                            label,
+                            href,
+                            routerlink,
+                            score,
+                        )
+                        return True, False
+                    # Likely a toggle; allow a rescan so newly visible menu items can be clicked.
+                    logger.debug(
+                        "Clicked non-nav candidate (label=%r; no href/routerlink; score=%s) - will rescan.",
+                        label,
+                        score,
+                    )
+                    clicked_non_nav = True
+                    return False, True
+                except Exception:
+                    continue
+
+            return False, clicked_non_nav
+
+        # Do a few rounds to allow "toggle then click submenu" patterns.
+        for _round in range(3):
+            expanded_menu = False
+            for t in nav_texts:
+                pat = re.compile(re.escape(t), re.I)
+
+                navigated, clicked_non_nav = _try_locator_group(t, page.get_by_role("link", name=pat))
+                if navigated:
+                    return
+                expanded_menu = expanded_menu or clicked_non_nav
+
+                navigated, clicked_non_nav = _try_locator_group(t, page.get_by_role("button", name=pat))
+                if navigated:
+                    return
+                expanded_menu = expanded_menu or clicked_non_nav
+
+                # Fallback: for longer labels, try clicking by visible text (can match custom elements).
+                # We keep this low-impact by still prioritizing candidates with href/routerlink.
+                if len(t) >= 7 or " " in t:
+                    navigated, clicked_non_nav = _try_locator_group(t, page.get_by_text(t, exact=False))
+                    if navigated:
+                        return
+                    expanded_menu = expanded_menu or clicked_non_nav
+
+            if not expanded_menu:
+                break
 
         # If we cannot navigate, dump debug and keep going (caller may still be on correct page).
         logger.warning("Could not navigate using texts=%s; continuing.", nav_texts)
