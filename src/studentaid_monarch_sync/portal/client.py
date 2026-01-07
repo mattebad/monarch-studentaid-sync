@@ -16,6 +16,7 @@ from playwright.sync_api import Frame, Page, sync_playwright
 from ..models import LoanSnapshot, PaymentAllocation
 from ..util.dates import parse_us_date
 from ..util.money import money_to_cents
+from ..util.debug_bundle import create_debug_bundle
 from .selectors import PortalSelectors
 
 
@@ -433,6 +434,183 @@ class ServicerPortalClient:
             finally:
                 browser.close()
 
+    def browse_and_capture(
+        self,
+        *,
+        debug_dir: str,
+        log_file: str,
+        out_dir: str = "data",
+        headless: bool = False,
+        storage_state_path: str = "data/servicer_storage_state.json",
+        mfa_code_provider: Optional[Callable[[], str]] = None,
+        mfa_method: str = "email",
+        force_fresh_session: bool = False,
+        slow_mo_ms: int = 0,
+        manual_mfa: bool = False,
+        no_login: bool = False,
+    ) -> Path:
+        """
+        Open a browser for manual portal exploration while capturing HTML+screenshots on navigation.
+
+        - If no_login=False, we attempt to authenticate first using the normal automation (and optional manual MFA).
+        - Captures are written to debug_dir (auto-generated if empty), and then zipped into a debug bundle when the
+          browser is closed.
+        """
+        provider = (self._canonical_host.split(".", 1)[0] if self._canonical_host else "").strip().lower()
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        cap_dir = Path(debug_dir) if debug_dir else Path(out_dir) / f"browse_capture_{provider or 'servicer'}_{stamp}"
+        cap_dir.mkdir(parents=True, exist_ok=True)
+
+        state_path = Path(storage_state_path) if storage_state_path else None
+
+        def _sanitize(s: str) -> str:
+            return re.sub(r"[^a-zA-Z0-9_-]+", "_", (s or "")).strip("_")[:80] or "page"
+
+        capture_counter = {"n": 0}
+        last_url_by_page: dict[int, str] = {}
+
+        def _capture(page: Page, *, reason: str) -> None:
+            try:
+                url = getattr(page, "url", "") or ""
+            except Exception:
+                url = ""
+
+            pid = id(page)
+            prev = last_url_by_page.get(pid, "")
+            if url and prev == url and reason != "manual":
+                return
+            last_url_by_page[pid] = url
+
+            capture_counter["n"] += 1
+            n = capture_counter["n"]
+            name = _sanitize(url.split("?", 1)[0].split("#", 1)[0]) if url else "unknown"
+            prefix = f"cap_{n:03d}_{_sanitize(reason)}_{name}"
+
+            try:
+                page.screenshot(path=str(cap_dir / f"{prefix}.png"), full_page=True)
+            except Exception:
+                pass
+            try:
+                (cap_dir / f"{prefix}.html").write_text(page.content(), encoding="utf-8")
+            except Exception:
+                pass
+            try:
+                (cap_dir / f"{prefix}.txt").write_text(page.inner_text("body"), encoding="utf-8")
+            except Exception:
+                pass
+
+        def _install_context_hooks(ctx) -> None:
+            # Same stability hooks as extract()/discover.
+            try:
+                if self._dark_host and self._canonical_host:
+                    def _rewrite(route, request) -> None:
+                        url = request.url
+                        fixed = url.replace(f"://{self._dark_host}", f"://{self._canonical_host}")
+                        route.continue_(url=fixed)
+
+                    ctx.route(re.compile(rf".*://{re.escape(self._dark_host)}/.*", re.I), _rewrite)
+            except Exception:
+                logger.debug("Failed to install dark-host rewrite route.", exc_info=True)
+
+            ctx.add_init_script(
+                """
+                (() => {
+                  const dismiss = () => {
+                    try {
+                      const accept = Array.from(document.querySelectorAll('button'))
+                        .find(b => /accept\\s+all/i.test((b.textContent || '').trim()));
+                      if (accept && /this\\s+site\\s+uses\\s+cookies/i.test(document.body?.innerText || '')) {
+                        accept.click();
+                      }
+                    } catch (_) {}
+                    try {
+                      const host = document.getElementById('transcend-consent-manager');
+                      if (host) {
+                        host.style.setProperty('display', 'none', 'important');
+                        host.style.setProperty('pointer-events', 'none', 'important');
+                      }
+                    } catch (_) {}
+                  };
+                  try {
+                    const observer = new MutationObserver(() => dismiss());
+                    observer.observe(document.documentElement, { childList: true, subtree: true });
+                    dismiss();
+                  } catch (_) {}
+                })();
+                """
+            )
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=headless, slow_mo=int(slow_mo_ms or 0))
+            try:
+                ctx_kwargs: dict = {"color_scheme": "light"}
+                if state_path and state_path.exists() and not force_fresh_session:
+                    if self._validate_or_restore_storage_state(state_path):
+                        ctx_kwargs["storage_state"] = str(state_path)
+
+                ctx = browser.new_context(**ctx_kwargs)
+                try:
+                    _install_context_hooks(ctx)
+
+                    page = ctx.new_page()
+
+                    # Capture on URL changes (SPA navigations) + initial load.
+                    def _on_nav(frame) -> None:
+                        try:
+                            if frame == page.main_frame:
+                                _capture(page, reason="navigate")
+                        except Exception:
+                            pass
+
+                    page.on("framenavigated", _on_nav)
+
+                    page.goto(self.base_url, wait_until="domcontentloaded")
+                    self._wait_for_settle(page)
+                    _capture(page, reason="start")
+
+                    if not no_login:
+                        self._login(
+                            page,
+                            mfa_code_provider=mfa_code_provider,
+                            mfa_method=mfa_method,
+                            debug_dir=str(cap_dir),
+                            manual_mfa=manual_mfa,
+                        )
+                        if state_path is not None:
+                            state_path.parent.mkdir(parents=True, exist_ok=True)
+                            ctx.storage_state(path=str(state_path))
+                            self._backup_storage_state(state_path)
+                        _capture(page, reason="after_login")
+
+                    print(
+                        "Browser is open for manual navigation. Close the browser window when finished; "
+                        "a debug bundle zip will be created."
+                    )
+
+                    # Wait until the page is closed by the user.
+                    try:
+                        page.wait_for_event("close")
+                    except Exception:
+                        pass
+                finally:
+                    try:
+                        ctx.close()
+                    except Exception:
+                        pass
+            finally:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+
+        # Always write a bundle on exit (even if user never navigated).
+        return create_debug_bundle(
+            debug_dir=str(cap_dir),
+            log_file=log_file,
+            out_dir=out_dir,
+            provider=provider,
+        )
+
     def _storage_state_backup_path(self, state_path: Path) -> Path:
         # e.g. data/servicer_storage_state_nelnet.json -> data/servicer_storage_state_nelnet.json.bak
         return state_path.with_name(state_path.name + ".bak")
@@ -614,12 +792,61 @@ class ServicerPortalClient:
         # Ensure we truly ended in an authenticated session before proceeding.
         if not self._looks_logged_in(page):
             self._save_debug(page, debug_dir=debug_dir, name_prefix="login_not_completed")
+            reason = self._best_effort_login_failure_reason(page)
+            if reason:
+                raise RuntimeError(reason)
             raise RuntimeError(
                 "Portal login did not complete (not authenticated after credentials/MFA). "
-                "This often indicates the OIDC callback is stuck or a redirect loop occurred."
+                "This may indicate invalid credentials, a redirect loop, or a stuck post-login callback."
             )
 
         self._step(page, debug_dir=debug_dir, name="login_complete")
+
+    def _best_effort_login_failure_reason(self, page: Page) -> Optional[str]:
+        """
+        Try to produce an actionable login failure message from the portal UI.
+
+        This is intentionally conservative: if we can't find a clear message, return None and let the
+        caller raise a generic error (with debug artifacts saved).
+        """
+        try:
+            body = page.inner_text("body")
+        except Exception:
+            body = ""
+
+        txt = (body or "").strip()
+        if not txt:
+            return None
+
+        # Common invalid-credential wording observed on Aidvantage.
+        if re.search(r"can\\s*'\\s*t\\s+find\\s+the\\s+user\\s+id\\s+and\\s+password\\s+combination", txt, re.I):
+            attempts_left = None
+            m = re.search(r"You\\s+have\\s+(\\d+)\\s+more\\s+attempts?", txt, re.I)
+            if m:
+                attempts_left = m.group(1)
+
+            extra = f" (attempts left: {attempts_left})" if attempts_left else ""
+            return (
+                "Login failed: the servicer portal rejected your User ID / Password. "
+                "Double-check SERVICER_USERNAME and SERVICER_PASSWORD and try again."
+                f"{extra}"
+            )
+
+        # Generic invalid/incorrect password messages.
+        if re.search(r"(invalid|incorrect).*(user\\s*id|username|password)", txt, re.I):
+            return (
+                "Login failed: the servicer portal reports your credentials are invalid/incorrect. "
+                "Double-check SERVICER_USERNAME and SERVICER_PASSWORD and try again."
+            )
+
+        # Account lock / throttling hints.
+        if re.search(r"account\\s+will\\s+be\\s+locked|account\\s+locked|too\\s+many\\s+attempts", txt, re.I):
+            return (
+                "Login failed: the portal indicates your account may be locked or you are out of attempts. "
+                "Try logging in manually in a browser to confirm account status, then retry."
+            )
+
+        return None
 
     def _looks_logged_in(self, page: Page) -> bool:
         """
@@ -727,8 +954,12 @@ class ServicerPortalClient:
             # Some portals gate the login form behind a federal usage disclaimer ("Accept / Decline").
             # Example: Aidvantage renders the inputs in HTML but hidden until clicking `button#Accept`.
             try:
+                looks_like_disclaimer = (
+                    page.get_by_text("Please Read Before Continuing", exact=False).count() > 0
+                    or page.get_by_text("Unauthorized use of this information system", exact=False).count() > 0
+                )
                 accept = page.locator(self.selectors.federal_disclaimer_accept_selector)
-                if accept.count() > 0 and accept.first.is_visible():
+                if looks_like_disclaimer and accept.count() > 0 and accept.first.is_visible():
                     accept.first.click()
                     self._wait_for_settle(page, timeout_ms=20_000)
                     self._step(page, debug_dir=debug_dir, name="after_accept_disclaimer")

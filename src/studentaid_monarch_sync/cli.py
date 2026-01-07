@@ -177,6 +177,42 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Extra delay (ms) after each captured step screenshot (so you can watch the browser).",
     )
 
+    browse = sub.add_parser(
+        "browse-portal",
+        help=(
+            "Open a Playwright browser for manual portal exploration while automatically capturing "
+            "HTML + screenshots on navigation. A zip bundle is written when you close the browser."
+        ),
+    )
+    browse.add_argument("--config", default="config.yaml", help="Path to YAML config (default: config.yaml)")
+    browse.add_argument(
+        "--no-login",
+        action="store_true",
+        help="Do not auto-login; just open the portal and let you log in manually.",
+    )
+    browse.add_argument(
+        "--manual-mfa",
+        action="store_true",
+        help="If auto-login hits MFA, pause and let you complete MFA manually in the browser (requires headful).",
+    )
+    browse.add_argument(
+        "--print-mfa-code",
+        action="store_true",
+        help="Print the full MFA code to stdout (debug). Avoid using in unattended/logged environments.",
+    )
+    browse.add_argument("--fresh-session", action="store_true", help="Do not reuse stored browser session.")
+    browse.add_argument("--slowmo-ms", type=int, default=0, help="Playwright slow motion in milliseconds (debug).")
+    browse.add_argument(
+        "--out-dir",
+        default="data",
+        help="Directory to write the resulting debug bundle zip (default: data).",
+    )
+    browse.add_argument(
+        "--capture-dir",
+        default="",
+        help="Optional directory to write captures (default: auto under data/).",
+    )
+
     return p
 
 
@@ -423,6 +459,36 @@ def main(argv: Optional[List[str]] = None) -> int:
         for k in sorted(KNOWN_SERVICERS.keys()):
             info = KNOWN_SERVICERS[k]
             print(f"{info.provider}\t{info.display_name}")
+        return 0
+
+    if args.cmd == "browse-portal":
+        cfg = load_config(args.config)
+        configure_logging(level=cfg.logging.level, file_path=cfg.logging.file_path)
+
+        provider = (cfg.servicer.provider or "servicer").strip().lower()
+        storage_state_path = f"data/servicer_storage_state_{provider}.json"
+
+        portal = ServicerPortalClient(
+            base_url=cfg.servicer.base_url,
+            creds=PortalCredentials(username=cfg.servicer.username, password=cfg.servicer.password),
+        )
+
+        mfa_provider = lambda: poll_gmail_imap_for_code(cfg.gmail_imap, print_code=args.print_mfa_code)
+
+        out_zip = portal.browse_and_capture(
+            debug_dir=args.capture_dir or "",
+            log_file=cfg.logging.file_path,
+            out_dir=args.out_dir,
+            headless=False,
+            storage_state_path=storage_state_path,
+            mfa_code_provider=mfa_provider,
+            mfa_method=cfg.servicer.mfa_method,
+            force_fresh_session=args.fresh_session,
+            slow_mo_ms=args.slowmo_ms,
+            manual_mfa=args.manual_mfa,
+            no_login=args.no_login,
+        )
+        print(f"✅ Debug bundle written: {out_zip}")
         return 0
 
     raise AssertionError("Unhandled command")
