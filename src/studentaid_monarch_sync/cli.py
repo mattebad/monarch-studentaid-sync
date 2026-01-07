@@ -475,21 +475,28 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         mfa_provider = lambda: poll_gmail_imap_for_code(cfg.gmail_imap, print_code=args.print_mfa_code)
 
-        out_zip = portal.browse_and_capture(
-            debug_dir=args.capture_dir or "",
-            log_file=cfg.logging.file_path,
-            out_dir=args.out_dir,
-            headless=False,
-            storage_state_path=storage_state_path,
-            mfa_code_provider=mfa_provider,
-            mfa_method=cfg.servicer.mfa_method,
-            force_fresh_session=args.fresh_session,
-            slow_mo_ms=args.slowmo_ms,
-            manual_mfa=args.manual_mfa,
-            no_login=args.no_login,
-        )
-        print(f"✅ Debug bundle written: {out_zip}")
-        return 0
+        try:
+            out_zip = portal.browse_and_capture(
+                debug_dir=args.capture_dir or "",
+                log_file=cfg.logging.file_path,
+                out_dir=args.out_dir,
+                headless=False,
+                storage_state_path=storage_state_path,
+                mfa_code_provider=mfa_provider,
+                mfa_method=cfg.servicer.mfa_method,
+                force_fresh_session=args.fresh_session,
+                slow_mo_ms=args.slowmo_ms,
+                manual_mfa=args.manual_mfa,
+                no_login=args.no_login,
+            )
+            print(f"✅ Debug bundle written: {out_zip}")
+            return 0
+        except KeyboardInterrupt:
+            print("Interrupted. (If any captures were created, check the data/ directory for a debug_bundle zip.)")
+            return 130
+        except Exception as e:
+            print(f"❌ browse-portal failed: {e}")
+            return 1
 
     raise AssertionError("Unhandled command")
 

@@ -540,76 +540,108 @@ class ServicerPortalClient:
                 """
             )
 
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=headless, slow_mo=int(slow_mo_ms or 0))
-            try:
-                ctx_kwargs: dict = {"color_scheme": "light"}
-                if state_path and state_path.exists() and not force_fresh_session:
-                    if self._validate_or_restore_storage_state(state_path):
-                        ctx_kwargs["storage_state"] = str(state_path)
-
-                ctx = browser.new_context(**ctx_kwargs)
+        bundle_path: Optional[Path] = None
+        err: Optional[BaseException] = None
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=headless, slow_mo=int(slow_mo_ms or 0))
                 try:
-                    _install_context_hooks(ctx)
+                    ctx_kwargs: dict = {"color_scheme": "light"}
+                    if state_path and state_path.exists() and not force_fresh_session:
+                        if self._validate_or_restore_storage_state(state_path):
+                            ctx_kwargs["storage_state"] = str(state_path)
 
-                    page = ctx.new_page()
+                    ctx = browser.new_context(**ctx_kwargs)
+                    try:
+                        _install_context_hooks(ctx)
 
-                    # Capture on URL changes (SPA navigations) + initial load.
-                    def _on_nav(frame) -> None:
+                        page = ctx.new_page()
+
+                        # Capture on URL changes (SPA navigations) + initial load.
+                        def _on_nav(frame) -> None:
+                            try:
+                                if frame == page.main_frame:
+                                    _capture(page, reason="navigate")
+                            except Exception:
+                                pass
+
+                        page.on("framenavigated", _on_nav)
+
+                        page.goto(self.base_url, wait_until="domcontentloaded")
+                        self._wait_for_settle(page)
+                        _capture(page, reason="start")
+
+                        if not no_login:
+                            self._login(
+                                page,
+                                mfa_code_provider=mfa_code_provider,
+                                mfa_method=mfa_method,
+                                debug_dir=str(cap_dir),
+                                manual_mfa=manual_mfa,
+                            )
+                            if state_path is not None:
+                                state_path.parent.mkdir(parents=True, exist_ok=True)
+                                ctx.storage_state(path=str(state_path))
+                                self._backup_storage_state(state_path)
+                            _capture(page, reason="after_login")
+
+                        print(
+                            "Browser is open for manual navigation. When finished, either close the tab/window "
+                            "or quit the browser. A debug bundle zip will be created on exit."
+                        )
+
+                        # Wait until either the page closes OR the browser disconnects.
+                        # Some platforms keep the app alive after closing the last window; polling avoids hangs.
+                        while True:
+                            try:
+                                if page.is_closed():
+                                    break
+                            except Exception:
+                                break
+                            try:
+                                if not browser.is_connected():
+                                    break
+                            except Exception:
+                                break
+                            try:
+                                page.wait_for_timeout(500)
+                            except Exception:
+                                break
+                    finally:
                         try:
-                            if frame == page.main_frame:
-                                _capture(page, reason="navigate")
+                            ctx.close()
                         except Exception:
                             pass
-
-                    page.on("framenavigated", _on_nav)
-
-                    page.goto(self.base_url, wait_until="domcontentloaded")
-                    self._wait_for_settle(page)
-                    _capture(page, reason="start")
-
-                    if not no_login:
-                        self._login(
-                            page,
-                            mfa_code_provider=mfa_code_provider,
-                            mfa_method=mfa_method,
-                            debug_dir=str(cap_dir),
-                            manual_mfa=manual_mfa,
-                        )
-                        if state_path is not None:
-                            state_path.parent.mkdir(parents=True, exist_ok=True)
-                            ctx.storage_state(path=str(state_path))
-                            self._backup_storage_state(state_path)
-                        _capture(page, reason="after_login")
-
-                    print(
-                        "Browser is open for manual navigation. Close the browser window when finished; "
-                        "a debug bundle zip will be created."
-                    )
-
-                    # Wait until the page is closed by the user.
-                    try:
-                        page.wait_for_event("close")
-                    except Exception:
-                        pass
                 finally:
                     try:
-                        ctx.close()
+                        browser.close()
                     except Exception:
                         pass
-            finally:
-                try:
-                    browser.close()
-                except Exception:
-                    pass
+        except BaseException as e:
+            # Still produce a bundle even if Playwright/browser exits unexpectedly or user Ctrl+C's.
+            err = e
+        finally:
+            try:
+                # Always write a bundle on exit (even if an exception occurred).
+                bundle_path = create_debug_bundle(
+                    debug_dir=str(cap_dir),
+                    log_file=log_file,
+                    out_dir=out_dir,
+                    provider=provider,
+                )
+            except Exception:
+                # If bundling fails, surface the original error if any.
+                if err:
+                    raise
+                raise
 
-        # Always write a bundle on exit (even if user never navigated).
-        return create_debug_bundle(
-            debug_dir=str(cap_dir),
-            log_file=log_file,
-            out_dir=out_dir,
-            provider=provider,
-        )
+        if err:
+            # Preserve Ctrl+C semantics but still return the bundle path via message.
+            if isinstance(err, KeyboardInterrupt):
+                return bundle_path  # type: ignore[return-value]
+            raise RuntimeError(f"browse-portal ended due to error: {err}. Debug bundle: {bundle_path}") from err
+
+        return bundle_path  # type: ignore[return-value]
 
     def _storage_state_backup_path(self, state_path: Path) -> Path:
         # e.g. data/servicer_storage_state_nelnet.json -> data/servicer_storage_state_nelnet.json.bak
