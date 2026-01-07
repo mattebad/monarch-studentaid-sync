@@ -528,15 +528,43 @@ class ServicerPortalClient:
                 self._step(page, debug_dir=debug_dir, name="already_logged_in_after_waiting_for_form")
                 return
             self._step(page, debug_dir=debug_dir, name="login_form_visible")
-            frame.locator(self.selectors.username_input).first.fill(self.creds.username)
+
+            def _first_visible(scope, selector: str):
+                loc = scope.locator(selector)
+                try:
+                    n = min(int(loc.count()), 25)
+                except Exception:
+                    n = 0
+                for i in range(n):
+                    cand = loc.nth(i)
+                    try:
+                        if cand.is_visible():
+                            return cand
+                    except Exception:
+                        continue
+                return None
+
+            user_input = _first_visible(frame, self.selectors.username_input)
+            if user_input is None:
+                # Common on portals that render hidden template inputs or gate the login UI behind a disclaimer.
+                self._save_debug(page, debug_dir=debug_dir, name_prefix="login_username_not_visible")
+                raise LoginFormNotFoundError("Login form username field found but none are visible.")
+
+            user_input.fill(self.creds.username)
             self._step(page, debug_dir=debug_dir, name="username_filled")
 
             # Some logins are two-step (username -> next -> password)
-            if frame.locator(self.selectors.password_input).count() == 0:
+            pwd_input = _first_visible(frame, self.selectors.password_input)
+            if pwd_input is None:
                 self._click_first_by_texts(frame, self.selectors.sign_in_submit_texts)
                 self._wait_for_settle(page)
+                pwd_input = _first_visible(frame, self.selectors.password_input)
 
-            frame.locator(self.selectors.password_input).first.fill(self.creds.password)
+            if pwd_input is None:
+                self._save_debug(page, debug_dir=debug_dir, name_prefix="login_password_not_visible")
+                raise LoginFormNotFoundError("Login form password field found but none are visible.")
+
+            pwd_input.fill(self.creds.password)
             self._step(page, debug_dir=debug_dir, name="password_filled")
         except Exception:
             self._save_debug(page, debug_dir=debug_dir, name_prefix="login_failure")
@@ -689,12 +717,24 @@ class ServicerPortalClient:
             if self._looks_logged_in(page):
                 return None
 
-            frame = self._find_frame_with_selector(page, self.selectors.username_input)
+            frame = self._find_frame_with_selector(page, self.selectors.username_input, require_visible=True)
             if frame:
                 return frame
 
             # Ensure consent UI isn't intercepting clicks.
             self._dismiss_cookie_banner(page, timeout_ms=3_000)
+
+            # Some portals gate the login form behind a federal usage disclaimer ("Accept / Decline").
+            # Example: Aidvantage renders the inputs in HTML but hidden until clicking `button#Accept`.
+            try:
+                accept = page.locator(self.selectors.federal_disclaimer_accept_selector)
+                if accept.count() > 0 and accept.first.is_visible():
+                    accept.first.click()
+                    self._wait_for_settle(page, timeout_ms=20_000)
+                    self._step(page, debug_dir=debug_dir, name="after_accept_disclaimer")
+                    continue
+            except Exception:
+                pass
 
             # Some flows show a pre-login choice page (Access Your Account vs Make a Payment...).
             if self._maybe_complete_login_choice(page):
@@ -740,7 +780,7 @@ class ServicerPortalClient:
                 return
 
             try:
-                if self._find_frame_with_selector(page, self.selectors.username_input) is not None:
+                if self._find_frame_with_selector(page, self.selectors.username_input, require_visible=True) is not None:
                     return
             except Exception:
                 pass
@@ -839,11 +879,22 @@ class ServicerPortalClient:
             logger.debug("Failed while attempting login-choice step; continuing.", exc_info=True)
             return False
 
-    def _find_frame_with_selector(self, page: Page, selector: str) -> Optional[Frame]:
+    def _find_frame_with_selector(self, page: Page, selector: str, *, require_visible: bool = False) -> Optional[Frame]:
         for frame in page.frames:
             try:
-                if frame.locator(selector).count() > 0:
+                loc = frame.locator(selector)
+                if loc.count() <= 0:
+                    continue
+                if not require_visible:
                     return frame
+                # Only consider the selector "present" if at least one match is visible.
+                # Some portals render hidden template inputs behind a disclaimer gate.
+                for i in range(min(int(loc.count()), 25)):
+                    try:
+                        if loc.nth(i).is_visible():
+                            return frame
+                    except Exception:
+                        continue
             except Exception:
                 continue
         return None

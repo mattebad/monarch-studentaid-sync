@@ -31,7 +31,13 @@ class PortalSelectors:
     login_choice_continue_text: str = "Continue"
     login_choice_borrower_radio_selector: str = 'input[type="radio"][data-cy="borrower-radio"], input[type="radio"]#borrower'
     login_choice_continue_selector: str = 'button#continue-button, button[data-cy="submit-form"]'
-    federal_disclaimer_accept_selector: str = 'button#accept-disclaimer, button[data-cy="accept-disclaimer"]'
+    # Various portals show a federal usage disclaimer gate that must be accepted before proceeding.
+    # Known variants:
+    # - CRI-style: button#accept-disclaimer / data-cy="accept-disclaimer"
+    # - Aidvantage-style: button#Accept (shows "Please Read Before Continuing" with Accept/Decline)
+    federal_disclaimer_accept_selector: str = (
+        'button#accept-disclaimer, button[data-cy="accept-disclaimer"], button#Accept'
+    )
 
     # MFA
     mfa_email_option_text: str = "Email"
