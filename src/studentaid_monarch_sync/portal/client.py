@@ -439,7 +439,7 @@ class ServicerPortalClient:
         *,
         debug_dir: str,
         log_file: str,
-        out_dir: str = "data",
+        out_dir: str = "data/debug",
         headless: bool = False,
         storage_state_path: str = "data/servicer_storage_state.json",
         mfa_code_provider: Optional[Callable[[], str]] = None,

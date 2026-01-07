@@ -204,8 +204,8 @@ def _build_parser() -> argparse.ArgumentParser:
     browse.add_argument("--slowmo-ms", type=int, default=0, help="Playwright slow motion in milliseconds (debug).")
     browse.add_argument(
         "--out-dir",
-        default="data",
-        help="Directory to write the resulting debug bundle zip (default: data).",
+        default="data/debug",
+        help="Directory to write the resulting debug bundle zip (default: data/debug).",
     )
     browse.add_argument(
         "--capture-dir",
