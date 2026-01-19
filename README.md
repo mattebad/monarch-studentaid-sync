@@ -24,7 +24,8 @@ At a high level, each scheduled run:
 #### Prereqs (set these up once) ✅
 - **Monarch auth** (choose one):
   - **Email/password**: set `MONARCH_EMAIL` + `MONARCH_PASSWORD`
-  - **Sign in with Apple**: set `MONARCH_TOKEN` (preferred). If you need help extracting it, see [Getting `MONARCH_TOKEN`](#monarch-token) 🍎
+    - If you currently use **Google** / “**Continue with Google**” to access Monarch, you’ll need to **set a password** to use the API client (Monarch → **Settings → Security**).
+  - **Sign in with Apple / Google (token-based)**: set `MONARCH_TOKEN` (recommended for SSO). If you need help extracting it, see [Getting `MONARCH_TOKEN`](#monarch-token).
 - **Gmail IMAP for MFA**
   - You’ll need **IMAP enabled** + **2‑Step Verification** + a **Google App Password**.
   - If you want the step-by-step Gmail label/filter setup (recommended), see [Gmail IMAP setup](#gmail-imap-setup) 🏷️
@@ -336,8 +337,10 @@ See **Quick start → Runtime A: Docker (recommended)** for the Unraid schedulin
 - `monarch.duplicate_guard_use_reference` / `MONARCH_DUPLICATE_GUARD_USE_REFERENCE` (optional): when the portal provides a payment confirmation/reference, use it as a Monarch search term during duplicate detection to reduce false positives for same-day identical payments.
 
 <a id="monarch-token"></a>
-### Getting `MONARCH_TOKEN` (for Sign in with Apple)
-1. Log into Monarch in your browser normally (using Apple).
+### Getting `MONARCH_TOKEN` (token-based auth for SSO)
+This works well for **Sign in with Apple** and **Continue with Google** flows, where password-based API login can be confusing.
+
+1. Log into Monarch in your browser normally (Apple/Google/etc).
 2. Open DevTools → **Network** tab.
 3. Click any request to Monarch’s API (often `graphql`).
 4. In **Request Headers**, copy the value after `Authorization: Token ...`.
