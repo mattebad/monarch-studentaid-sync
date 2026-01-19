@@ -222,6 +222,7 @@ class ServicerPortalClient:
                         )
                         payments = self._extract_payment_allocations(
                             page,
+                            groups=groups,
                             debug_dir=debug_dir,
                             max_payments_to_scan=max_payments_to_scan,
                             payments_since=payments_since,
@@ -1793,11 +1794,14 @@ class ServicerPortalClient:
         self,
         page: Page,
         *,
+        groups: list[str],
         debug_dir: str,
         max_payments_to_scan: int,
         payments_since: Optional[date] = None,
         expected_groups: Optional[set[str]] = None,
     ) -> list[PaymentAllocation]:
+        expected_groups = {g.strip().upper() for g in (groups or []) if (g or "").strip()}
+
         # Best-effort: navigate to payment activity and open the first N payment details.
         self._wait_for_post_login_ready(page, debug_dir=debug_dir, timeout_ms=90_000)
         self._step(page, debug_dir=debug_dir, name="payments_before_nav_payment_activity")
@@ -1886,7 +1890,7 @@ class ServicerPortalClient:
                         self._parse_payment_allocations(
                             body_text,
                             payment_date=payment_dt,
-                            expected_groups=expected_groups,
+                            expected_groups=expected_groups or None,
                         )
                     )
                 except Exception:
@@ -1929,7 +1933,7 @@ class ServicerPortalClient:
                         break
 
                 body_text = page.inner_text("body")
-                parsed = self._parse_payment_allocations(body_text, expected_groups=expected_groups)
+                parsed = self._parse_payment_allocations(body_text, expected_groups=expected_groups or None)
                 if payments_since and parsed and parsed[0].payment_date < payments_since:
                     logger.info(
                         "Stopping payment scan at %s (older than cutoff %s).",
@@ -1950,6 +1954,7 @@ class ServicerPortalClient:
         self,
         body_text: str,
         payment_date: Optional[date] = None,
+        *,
         expected_groups: Optional[set[str]] = None,
     ) -> list[PaymentAllocation]:
         # Payment date (prefer caller-provided date from the clicked row to avoid ambiguity)
@@ -1975,24 +1980,131 @@ class ServicerPortalClient:
         total_payment_cents: Optional[int] = None
         seen_groups: set[str] = set()
 
-        for ln in lines:
-            # Group rows like: \"AA  $31.20  $19.78  $11.42\"
-            m = re.match(
-                r"^([A-Z0-9][A-Z0-9-]{1,31})\s+\$?([\d,]+\.\d{2})\s+\$?([\d,]+\.\d{2})\s+\$?([\d,]+\.\d{2})\s*$",
-                ln,
-            )
+        money_re = re.compile(r"[-+]?\$?\s*[\d,]+\.\d{2}")
+        expected_group_re: Optional[re.Pattern[str]] = None
+        if expected_groups:
+            # Prefer longer tokens first (defensive; groups are usually 2 chars like "AA").
+            parts = sorted({g.strip().upper() for g in expected_groups if (g or "").strip()}, key=len, reverse=True)
+            if parts:
+                expected_group_re = re.compile(r"\b(" + "|".join(map(re.escape, parts)) + r")\b")
+
+        def _money_amounts(s: str) -> list[int]:
+            vals = money_re.findall(s or "")
+            out: list[int] = []
+            for v in vals:
+                try:
+                    out.append(money_to_cents(v))
+                except Exception:
+                    continue
+            return out
+
+        def _infer_total_principal_interest(amounts: list[int]) -> Optional[tuple[int, int, int]]:
+            """
+            Interpret a list of cents values as (total, principal, interest).
+
+            Supports a few common layouts:
+            - [total, principal, interest]
+            - [principal, interest, total]
+            - [principal, interest]  -> total = principal + interest
+            """
+            amts = [int(a) for a in amounts if a is not None]
+            if not amts:
+                return None
+
+            if len(amts) == 1:
+                return None
+
+            if len(amts) == 2:
+                a, b = amts
+                principal, interest = (a, b)
+                # Heuristic: principal is usually the larger component.
+                if abs(interest) > abs(principal):
+                    principal, interest = interest, principal
+                total = principal + interest
+                return total, principal, interest
+
+            # Use first 3 values by default, but try to infer which one is the total by sum-matching.
+            a, b, c = amts[0], amts[1], amts[2]
+            if a == b + c:
+                return a, b, c
+            if b == a + c:
+                return b, a, c
+            if c == a + b:
+                return c, a, b
+
+            # Fallback: pick the largest as the total, and the remaining as principal/interest.
+            trip = [a, b, c]
+            idx_total = max(range(3), key=lambda i: abs(trip[i]))
+            total = trip[idx_total]
+            rest = [trip[i] for i in range(3) if i != idx_total]
+            principal, interest = rest[0], rest[1]
+            if abs(interest) > abs(principal):
+                principal, interest = interest, principal
+            return total, principal, interest
+
+        def _extract_group_inline_row(ln: str) -> Optional[tuple[str, int, int, int]]:
+            """
+            Parse a single-line allocation row.
+            Accepts formats like:
+              - "AA  $31.20  $20.22  $10.98"
+              - "Loan Group AA  $31.20  $20.22  $10.98"
+              - "Group: AA  $31.20  $20.22  $10.98"
+            """
+            raw = (ln or "").strip()
+            if not raw:
+                return None
+
+            # Extract group
+            group: Optional[str] = None
+            if expected_group_re is not None:
+                # Some layouts include other text before the group (e.g. a "Details" toggle),
+                # so search for an expected group token anywhere in the row.
+                mg = expected_group_re.search(raw)
+                if mg:
+                    group = mg.group(1).upper()
+            m = re.match(r"^(?:Loan\s+Group|Group)\s*:?\s*([A-Z0-9]{2,8})\b", raw, re.I)
             if m:
                 group = m.group(1).upper()
-                if group in seen_groups:
-                    continue
-                total_applied = money_to_cents(m.group(2))
-                principal = money_to_cents(m.group(3))
-                interest = money_to_cents(m.group(4))
-                group_rows.append((group, total_applied, principal, interest))
-                seen_groups.add(group)
-                continue
+            else:
+                first = raw.split()[0] if raw.split() else ""
+                if re.fullmatch(r"[A-Z0-9]{2,8}", first):
+                    group = first.upper()
 
-            # Total row: \"Total $278.52 $184.12 $94.40\"
+            if not group or group == "TOTAL":
+                return None
+            if expected_groups is not None and group not in expected_groups:
+                return None
+
+            amts = _money_amounts(raw)
+            inferred = _infer_total_principal_interest(amts)
+            if not inferred:
+                return None
+            total, principal, interest = inferred
+            return group, total, principal, interest
+
+        def _is_group_code_only(ln: str) -> Optional[str]:
+            raw = (ln or "").strip()
+            if not raw:
+                return None
+
+            # "Loan Group: AA" or "Group AA"
+            m = re.match(r"^(?:Loan\s+Group|Group)\s*:?\s*([A-Z0-9]{2,8})\s*$", raw, re.I)
+            if m:
+                g = m.group(1).upper()
+                if g != "TOTAL" and (expected_groups is None or g in expected_groups):
+                    return g
+                return None
+
+            # Pure group code line (common when the portal renders tables responsively)
+            if re.fullmatch(r"[A-Z0-9]{2,4}", raw):
+                g = raw.upper()
+                if g != "TOTAL" and (expected_groups is None or g in expected_groups):
+                    return g
+            return None
+
+        # Pass 1: parse any obvious inline rows + total row (single line or label+values split across lines).
+        for idx, ln in enumerate(lines):
+            # Total row: "Total $278.52 $184.12 $94.40"
             m2 = re.match(
                 r"^Total\s+\$?([\d,]+\.\d{2})\s+\$?([\d,]+\.\d{2})\s+\$?([\d,]+\.\d{2})\s*$",
                 ln,
@@ -2002,50 +2114,112 @@ class ServicerPortalClient:
                 total_payment_cents = money_to_cents(m2.group(1))
                 continue
 
-            # Rows with prefix text: \"Toggle details row AA  $25.71  $14.41  $11.30\"
-            if expected:
-                amounts = re.findall(r"\$?[\d,]+\.\d{2}", ln)
-                if len(amounts) >= 3 and not ln.casefold().startswith("total"):
-                    matched_group = None
-                    for g in expected:
-                        if re.search(rf"\b{re.escape(g)}\b", ln, re.I):
-                            matched_group = g
-                            break
-                    if matched_group and matched_group not in seen_groups:
-                        total_applied = money_to_cents(amounts[-3])
-                        principal = money_to_cents(amounts[-2])
-                        interest = money_to_cents(amounts[-1])
-                        group_rows.append((matched_group, total_applied, principal, interest))
-                        seen_groups.add(matched_group)
+            # Total label on its own, followed by values on subsequent lines:
+            if total_payment_cents is None and re.fullmatch(r"Total", ln, re.I):
+                for j in range(idx + 1, min(idx + 6, len(lines))):
+                    nxt = lines[j]
+                    amts = _money_amounts(nxt)
+                    if amts:
+                        total_payment_cents = amts[0]
+                        break
 
-        if not group_rows:
-            # Multiline responsive layout: group code then 3 amounts on separate lines.
-            money_re = re.compile(r"^\$?[\d,]+\.\d{2}$")
-            group_re = re.compile(r"^[A-Z0-9][A-Z0-9-]{1,31}$")
-            i = 0
-            while i < len(lines):
-                ln = lines[i]
-                if ln.casefold() == "total" and i + 3 < len(lines):
-                    if money_re.match(lines[i + 1]) and money_re.match(lines[i + 2]) and money_re.match(lines[i + 3]):
-                        if total_payment_cents is None:
-                            total_payment_cents = money_to_cents(lines[i + 1])
-                        i += 4
-                        continue
+            row = _extract_group_inline_row(ln)
+            if row:
+                group_rows.append(row)
 
-                if group_re.match(ln) and i + 3 < len(lines):
-                    if money_re.match(lines[i + 1]) and money_re.match(lines[i + 2]) and money_re.match(lines[i + 3]):
-                        group = ln.upper()
-                        if expected and group not in expected:
-                            i += 4
-                            continue
-                        total_applied = money_to_cents(lines[i + 1])
-                        principal = money_to_cents(lines[i + 2])
-                        interest = money_to_cents(lines[i + 3])
-                        group_rows.append((group, total_applied, principal, interest))
-                        i += 4
-                        continue
-
+        # Pass 2: handle responsive layouts where each cell renders on its own line (group code, then amounts/labels).
+        #
+        # Example:
+        #   AA
+        #   $31.20
+        #   $20.22
+        #   $10.98
+        #
+        # Or:
+        #   Loan Group: AA
+        #   Total Applied
+        #   $31.20
+        #   Principal
+        #   $20.22
+        #   Interest
+        #   $10.98
+        seen_groups: set[str] = {g for (g, _, _, _) in group_rows}
+        i = 0
+        while i < len(lines):
+            g = _is_group_code_only(lines[i])
+            if not g or g in seen_groups:
                 i += 1
+                continue
+
+            # Gather a small block after the group label, stopping if we hit the next group or a Total row.
+            block = []
+            j = i + 1
+            max_lookahead = min(len(lines), i + 18)
+            while j < max_lookahead:
+                ln = lines[j]
+                if _is_group_code_only(ln):
+                    break
+                if re.match(r"^Total\b", ln, re.I):
+                    break
+                block.append(ln)
+                j += 1
+
+            pending_label: Optional[str] = None
+            total_applied: Optional[int] = None
+            principal: Optional[int] = None
+            interest: Optional[int] = None
+            loose_amounts: list[int] = []
+
+            def _label_from_line(s: str) -> Optional[str]:
+                low = (s or "").lower()
+                if "principal" in low:
+                    return "principal"
+                if "interest" in low:
+                    return "interest"
+                if "total" in low and ("applied" in low or "amount" in low or "payment" in low):
+                    return "total"
+                if "total applied" in low:
+                    return "total"
+                return None
+
+            for ln in block:
+                label = _label_from_line(ln)
+                amts = _money_amounts(ln)
+
+                if not amts:
+                    if label:
+                        pending_label = label
+                    continue
+
+                loose_amounts.extend(amts)
+
+                # If the label is in the same line (e.g. "Principal $20.22"), or we saw a label on a prior line.
+                use_label = label or pending_label
+                if use_label and len(amts) == 1:
+                    if use_label == "total" and total_applied is None:
+                        total_applied = amts[0]
+                    elif use_label == "principal" and principal is None:
+                        principal = amts[0]
+                    elif use_label == "interest" and interest is None:
+                        interest = amts[0]
+                    pending_label = None
+
+            # Fallback: infer from the first few amounts found in the block.
+            inferred = _infer_total_principal_interest(loose_amounts)
+            if inferred:
+                inf_total, inf_principal, inf_interest = inferred
+                if total_applied is None:
+                    total_applied = inf_total
+                if principal is None:
+                    principal = inf_principal
+                if interest is None:
+                    interest = inf_interest
+
+            if total_applied is not None and principal is not None and interest is not None:
+                group_rows.append((g, total_applied, principal, interest))
+                seen_groups.add(g)
+
+            i = j if j > i else i + 1
 
         if not group_rows:
             raise RuntimeError("Could not parse any group allocation rows from payment detail page")
