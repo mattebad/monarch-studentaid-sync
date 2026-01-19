@@ -126,81 +126,80 @@ def _try_fetch_code_once(
     print_code: bool,
     checked_msg_ids: set[bytes],
 ) -> Optional[str]:
-    try:
-        # Re-select in case the server dropped the selected mailbox between polls.
-        sel_status, _ = mail.select(cfg.folder)
-        if sel_status != "OK":
-            raise RuntimeError(f"IMAP select failed for folder={cfg.folder!r}: {sel_status}")
+    # Re-select in case the server dropped the selected mailbox between polls.
+    sel_status, _ = mail.select(cfg.folder)
+    if sel_status != "OK":
+        raise RuntimeError(f"IMAP select failed for folder={cfg.folder!r}: {sel_status}")
 
-        # Search ALL so we can still find the message even if Gmail/filter marks it read.
-        search_parts: list[str] = ["ALL"]
-        if cfg.sender_hint:
-            search_parts += ["FROM", f"\"{cfg.sender_hint}\""]
-        # If the user didn't configure a hint, default to the common subject shown on the MFA page.
-        subject = (cfg.subject_hint or "").strip() or "Authorization Code"
-        search_parts += ["SUBJECT", f"\"{subject}\""]
+    # Search ALL so we can still find the message even if Gmail/filter marks it read.
+    search_parts: list[str] = ["ALL"]
+    if cfg.sender_hint:
+        search_parts += ["FROM", f"\"{cfg.sender_hint}\""]
+    # If the user didn't configure a hint, default to the common subject shown on the MFA page.
+    subject = (cfg.subject_hint or "").strip() or "Authorization Code"
+    search_parts += ["SUBJECT", f"\"{subject}\""]
 
-        status, data = mail.search(None, *search_parts)
-        if status != "OK":
-            raise RuntimeError(f"IMAP search failed: {status} {data}")
+    status, data = mail.search(None, *search_parts)
+    if status != "OK":
+        raise RuntimeError(f"IMAP search failed: {status} {data}")
 
-        ids = data[0].split()
-        if not ids:
-            return None
-
-        # Newest first
-        for msg_id in reversed(ids[-25:]):
-            if msg_id in checked_msg_ids:
-                continue
-            status, msg_data = mail.fetch(msg_id, "(RFC822)")
-            if status != "OK" or not msg_data or not msg_data[0]:
-                continue
-            checked_msg_ids.add(msg_id)
-
-            raw = msg_data[0][1]
-            msg = message_from_bytes(raw)
-            received_at = _best_effort_msg_datetime_utc(msg)
-            if not received_at:
-                continue
-            if received_at < min_received_at:
-                # Too old; keep looking for a fresh code generated for *this* login.
-                continue
-
-            body = _extract_best_effort_body(msg)
-
-            code = _extract_code(body, preferred_res=preferred_res, fallback_re=code_re)
-            if not code:
-                continue
-            # Mark as seen so we don't reuse the same email.
-            try:
-                mail.store(msg_id, "+FLAGS", "\\Seen")
-            except Exception:
-                logger.debug("Failed to mark message as seen (msg_id=%s).", msg_id, exc_info=True)
-
-            subject = (msg.get("Subject") or "").strip()
-            sender = (msg.get("From") or "").strip()
-            ts = received_at.isoformat()
-
-            masked = f"{code[:2]}****{code[-2:]}" if len(code) >= 4 else "***"
-            logger.info(
-                "Fetched MFA code from email (received_at=%s subject=%r from=%r code=%s)",
-                ts,
-                subject,
-                sender,
-                masked,
-            )
-            # For headful debugging, optionally print the full code to the terminal so you can
-            # visually confirm we're grabbing the correct email. This is intentionally not logged
-            # to the file handler.
-            if print_code:
-                print(f"[MFA] code={code} received_at={ts} subject={subject!r}")
-            return code
-
+    ids = data[0].split()
+    if not ids:
         return None
     except Exception:
         # Treat transient IMAP parsing/search issues as "no code yet"; caller will retry.
         logger.debug("IMAP fetch attempt failed; treating as no-code.", exc_info=True)
         return None
+
+    # Newest first
+    for msg_id in reversed(ids[-25:]):
+        if msg_id in checked_msg_ids:
+            continue
+        status, msg_data = mail.fetch(msg_id, "(RFC822)")
+        if status != "OK" or not msg_data or not msg_data[0]:
+            continue
+        checked_msg_ids.add(msg_id)
+
+        raw = msg_data[0][1]
+        msg = message_from_bytes(raw)
+        received_at = _best_effort_msg_datetime_utc(msg)
+        if not received_at:
+            continue
+        if received_at < min_received_at:
+            # Too old; keep looking for a fresh code generated for *this* login.
+            continue
+
+        body = _extract_best_effort_body(msg)
+
+        code = _extract_code(body, preferred_res=preferred_res, fallback_re=code_re)
+        if not code:
+            continue
+        # Mark as seen so we don't reuse the same email.
+        try:
+            mail.store(msg_id, "+FLAGS", "\\Seen")
+        except Exception:
+            logger.debug("Failed to mark message as seen (msg_id=%s).", msg_id, exc_info=True)
+
+        subject = (msg.get("Subject") or "").strip()
+        sender = (msg.get("From") or "").strip()
+        ts = received_at.isoformat()
+
+        masked = f"{code[:2]}****{code[-2:]}" if len(code) >= 4 else "***"
+        logger.info(
+            "Fetched MFA code from email (received_at=%s subject=%r from=%r code=%s)",
+            ts,
+            subject,
+            sender,
+            masked,
+        )
+        # For headful debugging, optionally print the full code to the terminal so you can
+        # visually confirm we're grabbing the correct email. This is intentionally not logged
+        # to the file handler.
+        if print_code:
+            print(f"[MFA] code={code} received_at={ts} subject={subject!r}")
+        return code
+
+    return None
 
 
 def _extract_best_effort_body(msg: Message) -> str:
