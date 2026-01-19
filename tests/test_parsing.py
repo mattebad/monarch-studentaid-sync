@@ -145,5 +145,3 @@ def test_parse_payment_allocations_parses_row_with_prefix_text_when_expected_gro
     assert {a.group for a in allocs} == {"AA", "AB"}
     assert all(a.payment_date == date(2024, 12, 26) for a in allocs)
     assert all(a.payment_total_cents == (2571 + 1699) for a in allocs)
-
-
