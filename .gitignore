@@ -1,5 +1,6 @@
 # Local secrets / state
 .env
+portal.env
 data/
 config.yaml
 

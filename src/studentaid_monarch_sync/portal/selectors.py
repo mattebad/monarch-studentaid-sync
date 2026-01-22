@@ -52,7 +52,12 @@ class PortalSelectors:
     # Payment activity
     payment_detail_open_texts: tuple[str, ...] = ("View", "Details")
     payment_detail_ready_texts: tuple[str, ...] = ("Applied to Principal", "Applied to Interest", "Total Applied")
-    payment_detail_close_texts: tuple[str, ...] = ("Back", "Close")
+    payment_detail_close_texts: tuple[str, ...] = (
+        "Back to Payment Activity",
+        "Back to Payment History",
+        "Back",
+        "Close",
+    )
 
 
 # Backward-compatible alias (older code referenced `CriSelectors`).

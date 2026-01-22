@@ -86,6 +86,14 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     sync.add_argument("--max-payments", type=int, default=10, help="Max payment detail entries to scan (default: 10)")
     sync.add_argument(
+        "--allow-empty-loans",
+        action="store_true",
+        help=(
+            "If the servicer shows an empty/zero-balance loan summary with no Group sections, continue without loan "
+            "snapshots (useful for testing or closed accounts). Default: false (missing groups is an error)."
+        ),
+    )
+    sync.add_argument(
         "--payments-since",
         default="",
         help="Only create payment transactions for payments on/after this date (YYYY-MM-DD).",
@@ -311,6 +319,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     step_debug=args.step_debug,
                     step_delay_ms=args.step_delay_ms,
                     manual_mfa=args.manual_mfa,
+                    allow_empty_loans=args.allow_empty_loans,
                 )
                 logger.info("Portal extract complete (seconds=%.2f)", time.time() - t_portal)
 

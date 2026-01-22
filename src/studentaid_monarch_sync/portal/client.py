@@ -76,6 +76,7 @@ class ServicerPortalClient:
         step_debug: bool = False,
         step_delay_ms: int = 0,
         manual_mfa: bool = False,
+        allow_empty_loans: bool = False,
     ) -> tuple[list[LoanSnapshot], list[PaymentAllocation]]:
         # Configure per-run step debug behavior.
         self._step_debug_enabled = step_debug
@@ -213,12 +214,18 @@ class ServicerPortalClient:
                             ctx.storage_state(path=str(state_path))
                             self._backup_storage_state(state_path)
 
-                        loans = self._extract_loans(page, groups=groups, debug_dir=debug_dir)
+                        loans = self._extract_loans(
+                            page,
+                            groups=groups,
+                            debug_dir=debug_dir,
+                            allow_empty_loans=bool(allow_empty_loans),
+                        )
                         payments = self._extract_payment_allocations(
                             page,
                             debug_dir=debug_dir,
                             max_payments_to_scan=max_payments_to_scan,
                             payments_since=payments_since,
+                            expected_groups=set(groups) if groups else None,
                         )
                         return loans, payments
                     except Exception as e:
@@ -1445,7 +1452,14 @@ class ServicerPortalClient:
 
         return False
 
-    def _extract_loans(self, page: Page, *, groups: list[str], debug_dir: str) -> list[LoanSnapshot]:
+    def _extract_loans(
+        self,
+        page: Page,
+        *,
+        groups: list[str],
+        debug_dir: str,
+        allow_empty_loans: bool = False,
+    ) -> list[LoanSnapshot]:
         self._step(page, debug_dir=debug_dir, name="loans_before_nav_my_loans")
         # Race-condition guard: on slower machines the app may still be on the post-login callback screen.
         self._wait_for_post_login_ready(page, debug_dir=debug_dir, timeout_ms=90_000)
@@ -1464,6 +1478,12 @@ class ServicerPortalClient:
 
         if not self._wait_for_body_text_contains(page, "Group:", timeout_ms=30_000):
             self._save_debug(page, debug_dir=debug_dir, name_prefix="loan_details_not_loaded")
+            body_text = page.inner_text("body")
+            if allow_empty_loans and self._looks_like_empty_loans_summary(body_text):
+                logger.warning(
+                    "Loan details page shows no active loans (zero balance); skipping loan snapshot extraction."
+                )
+                return []
             raise RuntimeError("Loan details page did not load (missing 'Group:' sections).")
 
         self._step(page, debug_dir=debug_dir, name="loans_after_nav_my_loans")
@@ -1518,6 +1538,91 @@ class ServicerPortalClient:
 
             out.append((token, label, section_text))
         return out
+
+    def _looks_like_empty_loans_summary(self, body_text: str) -> bool:
+        """
+        Detect a "no active loans" summary page (no Group sections, zero balance).
+        """
+        t = (body_text or "").casefold()
+        if "group and loan summary" not in t:
+            return False
+        if not re.search(r"current balance\s*:\s*\$?\s*0\.00", t):
+            return False
+        if not re.search(r"current amount due\s*:\s*\$?\s*0\.00", t):
+            return False
+        return True
+
+    def _looks_like_no_recent_payments(self, body_text: str) -> bool:
+        t = (body_text or "").casefold()
+        return "no payments have been made in the last 12 months" in t
+
+    def _looks_like_no_payment_history(self, body_text: str) -> bool:
+        t = (body_text or "").casefold()
+        if "no payments have been made" in t:
+            return True
+        if "no payment history" in t or "no payments found" in t:
+            return True
+        return False
+
+    def _click_payment_history_all(self, page: Page) -> bool:
+        try:
+            selects = page.locator("select")
+            n = min(int(selects.count()), 10)
+            for i in range(n):
+                sel = selects.nth(i)
+                try:
+                    options = [o.strip() for o in sel.locator("option").all_inner_texts()]
+                except Exception:
+                    options = []
+                if any(o.casefold() == "all" for o in options):
+                    sel.select_option(label="All")
+                    self._wait_for_settle(page)
+                    return True
+        except Exception:
+            pass
+
+        for loc in (
+            page.get_by_role("button", name=re.compile(r"Last\s+12\s+Months", re.I)),
+            page.get_by_text("Last 12 Months", exact=True),
+        ):
+            try:
+                n = min(int(loc.count()), 10)
+            except Exception:
+                n = 0
+            for i in range(n):
+                el = loc.nth(i)
+                try:
+                    if not el.is_visible():
+                        continue
+                    el.scroll_into_view_if_needed(timeout=2_000)
+                    el.click(timeout=5_000)
+                    self._wait_for_settle(page)
+                    break
+                except Exception:
+                    continue
+
+        targets = (
+            page.get_by_role("button", name=re.compile(r"^All$", re.I)),
+            page.get_by_role("link", name=re.compile(r"^All$", re.I)),
+            page.get_by_text("All", exact=True),
+        )
+        for loc in targets:
+            try:
+                n = min(int(loc.count()), 10)
+            except Exception:
+                n = 0
+            for i in range(n):
+                el = loc.nth(i)
+                try:
+                    if not el.is_visible():
+                        continue
+                    el.scroll_into_view_if_needed(timeout=2_000)
+                    el.click(timeout=5_000)
+                    self._wait_for_settle(page)
+                    return True
+                except Exception:
+                    continue
+        return False
 
     def _match_group_section_text(self, sections: list[tuple[str, str, str]], *, group: str) -> str:
         """
@@ -1691,6 +1796,7 @@ class ServicerPortalClient:
         debug_dir: str,
         max_payments_to_scan: int,
         payments_since: Optional[date] = None,
+        expected_groups: Optional[set[str]] = None,
     ) -> list[PaymentAllocation]:
         # Best-effort: navigate to payment activity and open the first N payment details.
         self._wait_for_post_login_ready(page, debug_dir=debug_dir, timeout_ms=90_000)
@@ -1702,18 +1808,33 @@ class ServicerPortalClient:
         # These appear as links like "11/26/2025".
         # Payment date entries may be links, buttons, or plain clickable cells depending on UI changes.
         date_re = re.compile(r"^\s*\d{1,2}/\d{1,2}/\d{4}\s*$")
-        date_texts: list[str] = []
-        for loc in (
-            page.get_by_role("link", name=date_re),
-            page.get_by_role("button", name=date_re),
-            page.get_by_text(date_re),
-        ):
-            try:
-                date_texts = [t.strip() for t in loc.all_inner_texts() if t.strip()]
-            except Exception:
-                date_texts = []
-            if date_texts:
-                break
+        def _collect_date_texts() -> list[str]:
+            for loc in (
+                page.get_by_role("link", name=date_re),
+                page.get_by_role("button", name=date_re),
+                page.get_by_text(date_re),
+            ):
+                try:
+                    date_texts = [t.strip() for t in loc.all_inner_texts() if t.strip()]
+                except Exception:
+                    date_texts = []
+                if date_texts:
+                    return date_texts
+            return []
+
+        date_texts = _collect_date_texts()
+        if not date_texts:
+            body_text = page.inner_text("body")
+            if self._looks_like_no_recent_payments(body_text):
+                if self._click_payment_history_all(page):
+                    date_texts = _collect_date_texts()
+                    if not date_texts:
+                        body_text = page.inner_text("body")
+
+            if not date_texts and self._looks_like_no_payment_history(body_text):
+                logger.warning("No payment history entries found; skipping payment allocation extraction.")
+                self._save_debug(page, debug_dir=debug_dir, name_prefix="payment_activity_no_history")
+                return []
 
         if date_texts:
             # Keep order but drop duplicates.
@@ -1761,17 +1882,19 @@ class ServicerPortalClient:
                     self._step(page, debug_dir=debug_dir, name=f"payments_after_open_{idx}_{dt_str}")
 
                     body_text = page.inner_text("body")
-                    allocations.extend(self._parse_payment_allocations(body_text, payment_date=payment_dt))
+                    allocations.extend(
+                        self._parse_payment_allocations(
+                            body_text,
+                            payment_date=payment_dt,
+                            expected_groups=expected_groups,
+                        )
+                    )
                 except Exception:
                     self._save_debug(page, debug_dir=debug_dir, name_prefix=f"payment_detail_{idx}_error")
                     raise
                 finally:
                     # Return to Payment Activity list without relying on browser history.
-                    try:
-                        self._goto_section(page, self.selectors.nav_payment_activity_text, debug_dir=debug_dir)
-                        self._wait_for_settle(page)
-                    except Exception:
-                        self._close_payment_detail(page)
+                    self._close_payment_detail(page)
 
             return allocations
 
@@ -1806,7 +1929,7 @@ class ServicerPortalClient:
                         break
 
                 body_text = page.inner_text("body")
-                parsed = self._parse_payment_allocations(body_text)
+                parsed = self._parse_payment_allocations(body_text, expected_groups=expected_groups)
                 if payments_since and parsed and parsed[0].payment_date < payments_since:
                     logger.info(
                         "Stopping payment scan at %s (older than cutoff %s).",
@@ -1823,7 +1946,12 @@ class ServicerPortalClient:
 
         return allocations
 
-    def _parse_payment_allocations(self, body_text: str, payment_date: Optional[date] = None) -> list[PaymentAllocation]:
+    def _parse_payment_allocations(
+        self,
+        body_text: str,
+        payment_date: Optional[date] = None,
+        expected_groups: Optional[set[str]] = None,
+    ) -> list[PaymentAllocation]:
         # Payment date (prefer caller-provided date from the clicked row to avoid ambiguity)
         if payment_date is None:
             payment_date = self._find_payment_date(body_text)
@@ -1841,9 +1969,11 @@ class ServicerPortalClient:
                 break
 
         lines = [ln.strip() for ln in body_text.splitlines() if ln.strip()]
+        expected = {g.upper() for g in (expected_groups or set())}
 
         group_rows: list[tuple[str, int, int, int]] = []
         total_payment_cents: Optional[int] = None
+        seen_groups: set[str] = set()
 
         for ln in lines:
             # Group rows like: \"AA  $31.20  $19.78  $11.42\"
@@ -1853,10 +1983,13 @@ class ServicerPortalClient:
             )
             if m:
                 group = m.group(1).upper()
+                if group in seen_groups:
+                    continue
                 total_applied = money_to_cents(m.group(2))
                 principal = money_to_cents(m.group(3))
                 interest = money_to_cents(m.group(4))
                 group_rows.append((group, total_applied, principal, interest))
+                seen_groups.add(group)
                 continue
 
             # Total row: \"Total $278.52 $184.12 $94.40\"
@@ -1867,6 +2000,52 @@ class ServicerPortalClient:
             )
             if m2 and total_payment_cents is None:
                 total_payment_cents = money_to_cents(m2.group(1))
+                continue
+
+            # Rows with prefix text: \"Toggle details row AA  $25.71  $14.41  $11.30\"
+            if expected:
+                amounts = re.findall(r"\$?[\d,]+\.\d{2}", ln)
+                if len(amounts) >= 3 and not ln.casefold().startswith("total"):
+                    matched_group = None
+                    for g in expected:
+                        if re.search(rf"\b{re.escape(g)}\b", ln, re.I):
+                            matched_group = g
+                            break
+                    if matched_group and matched_group not in seen_groups:
+                        total_applied = money_to_cents(amounts[-3])
+                        principal = money_to_cents(amounts[-2])
+                        interest = money_to_cents(amounts[-1])
+                        group_rows.append((matched_group, total_applied, principal, interest))
+                        seen_groups.add(matched_group)
+
+        if not group_rows:
+            # Multiline responsive layout: group code then 3 amounts on separate lines.
+            money_re = re.compile(r"^\$?[\d,]+\.\d{2}$")
+            group_re = re.compile(r"^[A-Z0-9][A-Z0-9-]{1,31}$")
+            i = 0
+            while i < len(lines):
+                ln = lines[i]
+                if ln.casefold() == "total" and i + 3 < len(lines):
+                    if money_re.match(lines[i + 1]) and money_re.match(lines[i + 2]) and money_re.match(lines[i + 3]):
+                        if total_payment_cents is None:
+                            total_payment_cents = money_to_cents(lines[i + 1])
+                        i += 4
+                        continue
+
+                if group_re.match(ln) and i + 3 < len(lines):
+                    if money_re.match(lines[i + 1]) and money_re.match(lines[i + 2]) and money_re.match(lines[i + 3]):
+                        group = ln.upper()
+                        if expected and group not in expected:
+                            i += 4
+                            continue
+                        total_applied = money_to_cents(lines[i + 1])
+                        principal = money_to_cents(lines[i + 2])
+                        interest = money_to_cents(lines[i + 3])
+                        group_rows.append((group, total_applied, principal, interest))
+                        i += 4
+                        continue
+
+                i += 1
 
         if not group_rows:
             raise RuntimeError("Could not parse any group allocation rows from payment detail page")
@@ -1909,7 +2088,26 @@ class ServicerPortalClient:
                     page.wait_for_timeout(500)
                     return
             except Exception:
-                continue
+                pass
+
+            try:
+                link = page.get_by_role("link", name=t)
+                if link.count() > 0:
+                    link.first.click()
+                    page.wait_for_timeout(500)
+                    return
+            except Exception:
+                pass
+
+            if len(t) >= 7 or " " in t:
+                try:
+                    txt = page.get_by_text(t, exact=False)
+                    if txt.count() > 0:
+                        txt.first.click()
+                        page.wait_for_timeout(500)
+                        return
+                except Exception:
+                    pass
 
         # Try navigating back to Payment Activity explicitly.
         try:
