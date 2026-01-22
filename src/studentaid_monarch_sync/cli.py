@@ -86,6 +86,14 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     sync.add_argument("--max-payments", type=int, default=10, help="Max payment detail entries to scan (default: 10)")
     sync.add_argument(
+        "--allow-empty-loans",
+        action="store_true",
+        help=(
+            "If the servicer shows an empty/zero-balance loan summary with no Group sections, continue without loan "
+            "snapshots (useful for testing or closed accounts). Default: false (missing groups is an error)."
+        ),
+    )
+    sync.add_argument(
         "--payments-since",
         default="",
         help="Only create payment transactions for payments on/after this date (YYYY-MM-DD).",
@@ -147,6 +155,71 @@ def _build_parser() -> argparse.ArgumentParser:
     preflight.add_argument("--skip-monarch", action="store_true", help="Skip Monarch auth check")
     preflight.add_argument("--skip-imap", action="store_true", help="Skip Gmail IMAP connectivity check")
 
+    list_groups = sub.add_parser(
+        "list-loan-groups",
+        help="Log into your servicer portal and list discovered loan groups (helps you set LOAN_GROUPS).",
+    )
+    list_groups.add_argument("--config", default="config.yaml", help="Path to YAML config (default: config.yaml)")
+    list_groups.add_argument("--headful", action="store_true", help="Run browser headful (debug)")
+    list_groups.add_argument(
+        "--fresh-session",
+        action="store_true",
+        help="Do not reuse stored browser session (cookies/localStorage). Helpful for weird redirects.",
+    )
+    list_groups.add_argument(
+        "--manual-mfa",
+        action="store_true",
+        help="In headful mode, pause and let you enter the MFA code manually in the browser (safer while debugging).",
+    )
+    list_groups.add_argument(
+        "--print-mfa-code",
+        action="store_true",
+        help="Print the full MFA code to stdout (debug). Requires --headful; avoid using in unattended/logged environments.",
+    )
+    list_groups.add_argument("--slowmo-ms", type=int, default=0, help="Playwright slow motion in milliseconds (debug).")
+    list_groups.add_argument("--step-debug", action="store_true", help="Save step-by-step screenshots under data/debug/.")
+    list_groups.add_argument(
+        "--step-delay-ms",
+        type=int,
+        default=0,
+        help="Extra delay (ms) after each captured step screenshot (so you can watch the browser).",
+    )
+
+    browse = sub.add_parser(
+        "browse-portal",
+        help=(
+            "Open a Playwright browser for manual portal exploration while automatically capturing "
+            "HTML + screenshots on navigation. A zip bundle is written when you close the browser."
+        ),
+    )
+    browse.add_argument("--config", default="config.yaml", help="Path to YAML config (default: config.yaml)")
+    browse.add_argument(
+        "--no-login",
+        action="store_true",
+        help="Do not auto-login; just open the portal and let you log in manually.",
+    )
+    browse.add_argument(
+        "--manual-mfa",
+        action="store_true",
+        help="If auto-login hits MFA, pause and let you complete MFA manually in the browser (requires headful).",
+    )
+    browse.add_argument(
+        "--print-mfa-code",
+        action="store_true",
+        help="Print the full MFA code to stdout (debug). Avoid using in unattended/logged environments.",
+    )
+    browse.add_argument("--fresh-session", action="store_true", help="Do not reuse stored browser session.")
+    browse.add_argument("--slowmo-ms", type=int, default=0, help="Playwright slow motion in milliseconds (debug).")
+    browse.add_argument(
+        "--out-dir",
+        default="data/debug",
+        help="Directory to write the resulting debug bundle zip (default: data/debug).",
+    )
+    browse.add_argument(
+        "--capture-dir",
+        default="",
+        help="Optional directory to write captures (default: auto under data/).",
+    )
     return p
 
 
@@ -166,6 +239,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         logger.info("Starting preflight checks")
 
         if not args.skip_monarch:
+            _require_monarch_auth(cfg)
             asyncio.run(_preflight_monarch(cfg))
 
         if not args.skip_imap:
@@ -201,6 +275,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             # - For real runs we *must* talk to Monarch, so validate now.
             # - For dry-run-check-monarch we also talk to Monarch, so validate now.
             needs_monarch = (not args.dry_run) or bool(args.dry_run_check_monarch)
+            if needs_monarch:
+                _require_monarch_auth(cfg)
             if needs_monarch and not args.skip_monarch_preflight:
                 asyncio.run(_preflight_monarch(cfg, check_mappings=not bool(args.auto_setup_accounts)))
 
@@ -243,6 +319,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     step_debug=args.step_debug,
                     step_delay_ms=args.step_delay_ms,
                     manual_mfa=args.manual_mfa,
+                    allow_empty_loans=args.allow_empty_loans,
                 )
                 logger.info("Portal extract complete (seconds=%.2f)", time.time() - t_portal)
 
@@ -304,12 +381,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.cmd == "list-monarch-accounts":
         cfg = load_config(args.config)
         configure_logging(level=cfg.logging.level, file_path=cfg.logging.file_path)
+        _require_monarch_auth(cfg)
         asyncio.run(_list_monarch_accounts(cfg))
         return 0
 
     if args.cmd == "setup-monarch-accounts":
         cfg = load_config(args.config)
         configure_logging(level=cfg.logging.level, file_path=cfg.logging.file_path)
+        _require_monarch_auth(cfg)
         asyncio.run(
             _setup_monarch_accounts(
                 cfg,
@@ -322,6 +401,67 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
         return 0
 
+    if args.cmd == "list-loan-groups":
+        cfg = load_config(args.config)
+        configure_logging(level=cfg.logging.level, file_path=cfg.logging.file_path)
+
+        if args.manual_mfa and not args.headful:
+            raise SystemExit("--manual-mfa requires --headful (you must be able to interact with the browser).")
+        if args.print_mfa_code and not args.headful:
+            raise SystemExit("--print-mfa-code requires --headful (avoid leaking codes into unattended logs).")
+
+        provider = (cfg.servicer.provider or "servicer").strip().lower()
+        storage_state_path = f"data/servicer_storage_state_{provider}.json"
+
+        portal = ServicerPortalClient(
+            base_url=cfg.servicer.base_url,
+            creds=PortalCredentials(username=cfg.servicer.username, password=cfg.servicer.password),
+        )
+        mfa_provider = lambda: poll_gmail_imap_for_code(cfg.gmail_imap, print_code=args.print_mfa_code)
+
+        groups = portal.discover_loan_groups(
+            headless=not args.headful,
+            storage_state_path=storage_state_path,
+            mfa_code_provider=mfa_provider,
+            mfa_method=cfg.servicer.mfa_method,
+            force_fresh_session=args.fresh_session,
+            slow_mo_ms=args.slowmo_ms,
+            step_debug=args.step_debug,
+            step_delay_ms=args.step_delay_ms,
+            manual_mfa=args.manual_mfa,
+        )
+
+        if not groups:
+            print("No loan groups found.")
+            return 0
+
+        print("Discovered loan groups:")
+        suggested: list[str] = []
+        seen: set[str] = set()
+        for token, label in groups:
+            tok = (token or "").strip()
+            lab = (label or "").strip()
+            if tok:
+                suggested.append(tok)
+            if tok and tok not in seen:
+                seen.add(tok)
+            print(f"- {tok or '(no token)'}\t{lab}")
+
+        if suggested:
+            # De-dupe suggested tokens, preserve order.
+            out: list[str] = []
+            seen2: set[str] = set()
+            for t in suggested:
+                if t in seen2:
+                    continue
+                out.append(t)
+                seen2.add(t)
+            print()
+            print("Suggested .env value:")
+            print(f"LOAN_GROUPS={','.join(out)}")
+
+        return 0
+
     if args.cmd == "list-servicers":
         # Print only; no config/env required.
         for k in sorted(KNOWN_SERVICERS.keys()):
@@ -329,7 +469,53 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"{info.provider}\t{info.display_name}")
         return 0
 
+    if args.cmd == "browse-portal":
+        cfg = load_config(args.config)
+        configure_logging(level=cfg.logging.level, file_path=cfg.logging.file_path)
+
+        provider = (cfg.servicer.provider or "servicer").strip().lower()
+        storage_state_path = f"data/servicer_storage_state_{provider}.json"
+
+        portal = ServicerPortalClient(
+            base_url=cfg.servicer.base_url,
+            creds=PortalCredentials(username=cfg.servicer.username, password=cfg.servicer.password),
+        )
+
+        mfa_provider = lambda: poll_gmail_imap_for_code(cfg.gmail_imap, print_code=args.print_mfa_code)
+
+        try:
+            out_zip = portal.browse_and_capture(
+                debug_dir=args.capture_dir or "",
+                log_file=cfg.logging.file_path,
+                out_dir=args.out_dir,
+                headless=False,
+                storage_state_path=storage_state_path,
+                mfa_code_provider=mfa_provider,
+                mfa_method=cfg.servicer.mfa_method,
+                force_fresh_session=args.fresh_session,
+                slow_mo_ms=args.slowmo_ms,
+                manual_mfa=args.manual_mfa,
+                no_login=args.no_login,
+            )
+            print(f"✅ Debug bundle written: {out_zip}")
+            return 0
+        except KeyboardInterrupt:
+            print("Interrupted. (If any captures were created, check the data/ directory for a debug_bundle zip.)")
+            return 130
+        except Exception as e:
+            print(f"❌ browse-portal failed: {e}")
+            return 1
+
     raise AssertionError("Unhandled command")
+
+
+def _require_monarch_auth(cfg) -> None:
+    m = cfg.monarch
+    if getattr(m, "token", ""):
+        return
+    if getattr(m, "email", "") and getattr(m, "password", ""):
+        return
+    raise SystemExit("Missing Monarch auth. Set MONARCH_TOKEN or MONARCH_EMAIL + MONARCH_PASSWORD in your .env.")
 
 
 async def _preflight_monarch(cfg, *, check_mappings: bool = True) -> None:

@@ -16,6 +16,7 @@ from playwright.sync_api import Frame, Page, sync_playwright
 from ..models import LoanSnapshot, PaymentAllocation
 from ..util.dates import parse_us_date
 from ..util.money import money_to_cents
+from ..util.debug_bundle import create_debug_bundle
 from .selectors import PortalSelectors
 
 
@@ -75,6 +76,7 @@ class ServicerPortalClient:
         step_debug: bool = False,
         step_delay_ms: int = 0,
         manual_mfa: bool = False,
+        allow_empty_loans: bool = False,
     ) -> tuple[list[LoanSnapshot], list[PaymentAllocation]]:
         # Configure per-run step debug behavior.
         self._step_debug_enabled = step_debug
@@ -212,12 +214,18 @@ class ServicerPortalClient:
                             ctx.storage_state(path=str(state_path))
                             self._backup_storage_state(state_path)
 
-                        loans = self._extract_loans(page, groups=groups, debug_dir=debug_dir)
+                        loans = self._extract_loans(
+                            page,
+                            groups=groups,
+                            debug_dir=debug_dir,
+                            allow_empty_loans=bool(allow_empty_loans),
+                        )
                         payments = self._extract_payment_allocations(
                             page,
                             debug_dir=debug_dir,
                             max_payments_to_scan=max_payments_to_scan,
                             payments_since=payments_since,
+                            expected_groups=set(groups) if groups else None,
                         )
                         return loans, payments
                     except Exception as e:
@@ -246,6 +254,401 @@ class ServicerPortalClient:
             finally:
                 browser.close()
 
+    def discover_loan_groups(
+        self,
+        *,
+        headless: bool = True,
+        storage_state_path: str = "data/servicer_storage_state.json",
+        debug_dir: str = "data/debug",
+        mfa_code_provider: Optional[Callable[[], str]] = None,
+        mfa_method: str = "email",
+        force_fresh_session: bool = False,
+        slow_mo_ms: int = 0,
+        step_debug: bool = False,
+        step_delay_ms: int = 0,
+        manual_mfa: bool = False,
+    ) -> list[tuple[str, str]]:
+        """
+        Log into the servicer portal and return discovered loan groups.
+
+        Returns: list of (group_token, group_label)
+        - group_token: short ID suitable for LOAN_GROUPS (e.g. "AA", "1-01") when parseable
+        - group_label: raw label after "Group:" (may include extra words)
+        """
+        # Configure per-run step debug behavior.
+        self._step_debug_enabled = step_debug
+        self._step_counter = 0
+        self._step_delay_ms = int(step_delay_ms or 0)
+
+        state_path = Path(storage_state_path) if storage_state_path else None
+        Path(debug_dir).mkdir(parents=True, exist_ok=True)
+
+        def _install_context_hooks(ctx) -> None:
+            # Keep behavior consistent with `extract()`.
+            try:
+                if not self._dark_host or not self._canonical_host:
+                    raise RuntimeError("canonical host missing")
+
+                def _rewrite(route, request) -> None:
+                    url = request.url
+                    fixed = url.replace(f"://{self._dark_host}", f"://{self._canonical_host}")
+                    route.continue_(url=fixed)
+
+                ctx.route(
+                    re.compile(rf".*://{re.escape(self._dark_host)}/.*", re.I),
+                    _rewrite,
+                )
+            except Exception:
+                logger.debug("Failed to install dark-host rewrite route.", exc_info=True)
+
+            ctx.add_init_script(
+                """
+                (() => {
+                  const dismiss = () => {
+                    try {
+                      const accept = Array.from(document.querySelectorAll('button'))
+                        .find(b => /accept\\s+all/i.test((b.textContent || '').trim()));
+                      if (accept && /this\\s+site\\s+uses\\s+cookies/i.test(document.body?.innerText || '')) {
+                        accept.click();
+                      }
+                    } catch (_) {}
+
+                    try {
+                      const host = document.getElementById('transcend-consent-manager');
+                      const root = host && host.shadowRoot;
+                      if (root) {
+                        const accept = Array.from(root.querySelectorAll('button'))
+                          .find(b => /accept\\s+all/i.test((b.textContent || '').trim()));
+                        if (accept) accept.click();
+                      }
+                    } catch (_) {}
+
+                    try {
+                      const host = document.getElementById('transcend-consent-manager');
+                      if (host) {
+                        host.style.setProperty('display', 'none', 'important');
+                        host.style.setProperty('pointer-events', 'none', 'important');
+                      }
+                    } catch (_) {}
+                  };
+
+                  try {
+                    const observer = new MutationObserver(() => dismiss());
+                    observer.observe(document.documentElement, { childList: true, subtree: true });
+                    dismiss();
+                  } catch (_) {}
+                })();
+                """
+            )
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=headless, slow_mo=slow_mo_ms)
+            try:
+                for attempt_idx in range(2):
+                    use_storage = (
+                        attempt_idx == 0 and not force_fresh_session and state_path is not None and state_path.exists()
+                    )
+                    if use_storage and state_path is not None:
+                        use_storage = self._validate_or_restore_storage_state(state_path)
+
+                    ctx_kwargs: dict = {}
+                    if use_storage:
+                        ctx_kwargs["storage_state"] = str(state_path)
+                    ctx_kwargs["color_scheme"] = "light"
+
+                    ctx = None
+                    try:
+                        ctx = browser.new_context(**ctx_kwargs)
+                    except Exception as e:
+                        if use_storage and state_path is not None:
+                            logger.warning(
+                                "Failed to create browser context with stored session; falling back to fresh session. (%s)",
+                                e,
+                            )
+                            self._quarantine_file(state_path, prefix="storage_state")
+                            ctx_kwargs.pop("storage_state", None)
+                            use_storage = False
+                            ctx = browser.new_context(**ctx_kwargs)
+                        else:
+                            raise
+
+                    _install_context_hooks(ctx)
+
+                    page = ctx.new_page()
+                    try:
+                        self._step(page, debug_dir=debug_dir, name=f"discover_start_attempt_{attempt_idx+1}")
+                        self._login(
+                            page,
+                            mfa_code_provider=mfa_code_provider,
+                            mfa_method=mfa_method,
+                            debug_dir=debug_dir,
+                            manual_mfa=manual_mfa,
+                        )
+
+                        if state_path is not None:
+                            state_path.parent.mkdir(parents=True, exist_ok=True)
+                            ctx.storage_state(path=str(state_path))
+                            self._backup_storage_state(state_path)
+
+                        # Navigate to loan details and parse "Group:" headers.
+                        self._wait_for_post_login_ready(page, debug_dir=debug_dir, timeout_ms=90_000)
+                        self._goto_section(page, self.selectors.nav_my_loans_text, debug_dir=debug_dir)
+
+                        # Some portals render multiple "My Loans" targets (nav, dashboard cards, footer).
+                        # We try to click the most likely navigation candidate first, but still keep a hard
+                        # fallback: if clicks don't land us on the loan details view, go directly by URL.
+                        if not self._wait_for_body_text_contains(page, "Group:", timeout_ms=15_000):
+                            try:
+                                page.goto(f"{self.base_url}/loan-details", wait_until="domcontentloaded")
+                                self._wait_for_settle(page, timeout_ms=30_000)
+                            except Exception:
+                                # We'll validate below; if still not loaded, we'll raise with debug artifacts.
+                                pass
+
+                        if not self._wait_for_body_text_contains(page, "Group:", timeout_ms=30_000):
+                            self._save_debug(page, debug_dir=debug_dir, name_prefix="discover_groups_not_loaded")
+                            raise RuntimeError(
+                                f"Loan details page did not load (missing 'Group:' sections). url={getattr(page, 'url', '')!r}"
+                            )
+
+                        body = page.inner_text("body")
+                        sections = self._extract_all_group_sections(body)
+                        groups: list[tuple[str, str]] = []
+                        seen: set[str] = set()
+                        for token, label, _ in sections:
+                            key = token or label
+                            if not key or key in seen:
+                                continue
+                            groups.append((token, label))
+                            seen.add(key)
+                        return groups
+                    except Exception as e:
+                        if attempt_idx == 0 and not force_fresh_session:
+                            retry_for_browser_error = self._looks_like_browser_error(page)
+                            retry_for_login_form = (
+                                use_storage and isinstance(e, LoginFormNotFoundError) and not self._looks_logged_in(page)
+                            )
+                            if retry_for_browser_error or retry_for_login_form:
+                                logger.warning(
+                                    "Portal navigation/login failed%s; retrying once with a fresh session (no stored cookies).",
+                                    " (stored session)" if use_storage else "",
+                                )
+                                self._save_debug(page, debug_dir=debug_dir, name_prefix="discover_retry_fresh_session")
+                                continue
+                        raise
+                    finally:
+                        ctx.close()
+            finally:
+                browser.close()
+
+    def browse_and_capture(
+        self,
+        *,
+        debug_dir: str,
+        log_file: str,
+        out_dir: str = "data/debug",
+        headless: bool = False,
+        storage_state_path: str = "data/servicer_storage_state.json",
+        mfa_code_provider: Optional[Callable[[], str]] = None,
+        mfa_method: str = "email",
+        force_fresh_session: bool = False,
+        slow_mo_ms: int = 0,
+        manual_mfa: bool = False,
+        no_login: bool = False,
+    ) -> Path:
+        """
+        Open a browser for manual portal exploration while capturing HTML+screenshots on navigation.
+
+        - If no_login=False, we attempt to authenticate first using the normal automation (and optional manual MFA).
+        - Captures are written to debug_dir (auto-generated if empty), and then zipped into a debug bundle when the
+          browser is closed.
+        """
+        provider = (self._canonical_host.split(".", 1)[0] if self._canonical_host else "").strip().lower()
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        cap_dir = Path(debug_dir) if debug_dir else Path(out_dir) / f"browse_capture_{provider or 'servicer'}_{stamp}"
+        cap_dir.mkdir(parents=True, exist_ok=True)
+
+        state_path = Path(storage_state_path) if storage_state_path else None
+
+        def _sanitize(s: str) -> str:
+            return re.sub(r"[^a-zA-Z0-9_-]+", "_", (s or "")).strip("_")[:80] or "page"
+
+        capture_counter = {"n": 0}
+        last_url_by_page: dict[int, str] = {}
+
+        def _capture(page: Page, *, reason: str) -> None:
+            try:
+                url = getattr(page, "url", "") or ""
+            except Exception:
+                url = ""
+
+            pid = id(page)
+            prev = last_url_by_page.get(pid, "")
+            if url and prev == url and reason != "manual":
+                return
+            last_url_by_page[pid] = url
+
+            capture_counter["n"] += 1
+            n = capture_counter["n"]
+            name = _sanitize(url.split("?", 1)[0].split("#", 1)[0]) if url else "unknown"
+            prefix = f"cap_{n:03d}_{_sanitize(reason)}_{name}"
+
+            try:
+                page.screenshot(path=str(cap_dir / f"{prefix}.png"), full_page=True)
+            except Exception:
+                pass
+            try:
+                (cap_dir / f"{prefix}.html").write_text(page.content(), encoding="utf-8")
+            except Exception:
+                pass
+            try:
+                (cap_dir / f"{prefix}.txt").write_text(page.inner_text("body"), encoding="utf-8")
+            except Exception:
+                pass
+
+        def _install_context_hooks(ctx) -> None:
+            # Same stability hooks as extract()/discover.
+            try:
+                if self._dark_host and self._canonical_host:
+                    def _rewrite(route, request) -> None:
+                        url = request.url
+                        fixed = url.replace(f"://{self._dark_host}", f"://{self._canonical_host}")
+                        route.continue_(url=fixed)
+
+                    ctx.route(re.compile(rf".*://{re.escape(self._dark_host)}/.*", re.I), _rewrite)
+            except Exception:
+                logger.debug("Failed to install dark-host rewrite route.", exc_info=True)
+
+            ctx.add_init_script(
+                """
+                (() => {
+                  const dismiss = () => {
+                    try {
+                      const accept = Array.from(document.querySelectorAll('button'))
+                        .find(b => /accept\\s+all/i.test((b.textContent || '').trim()));
+                      if (accept && /this\\s+site\\s+uses\\s+cookies/i.test(document.body?.innerText || '')) {
+                        accept.click();
+                      }
+                    } catch (_) {}
+                    try {
+                      const host = document.getElementById('transcend-consent-manager');
+                      if (host) {
+                        host.style.setProperty('display', 'none', 'important');
+                        host.style.setProperty('pointer-events', 'none', 'important');
+                      }
+                    } catch (_) {}
+                  };
+                  try {
+                    const observer = new MutationObserver(() => dismiss());
+                    observer.observe(document.documentElement, { childList: true, subtree: true });
+                    dismiss();
+                  } catch (_) {}
+                })();
+                """
+            )
+
+        bundle_path: Optional[Path] = None
+        err: Optional[BaseException] = None
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=headless, slow_mo=int(slow_mo_ms or 0))
+                try:
+                    ctx_kwargs: dict = {"color_scheme": "light"}
+                    if state_path and state_path.exists() and not force_fresh_session:
+                        if self._validate_or_restore_storage_state(state_path):
+                            ctx_kwargs["storage_state"] = str(state_path)
+
+                    ctx = browser.new_context(**ctx_kwargs)
+                    try:
+                        _install_context_hooks(ctx)
+
+                        page = ctx.new_page()
+
+                        # Capture on URL changes (SPA navigations) + initial load.
+                        def _on_nav(frame) -> None:
+                            try:
+                                if frame == page.main_frame:
+                                    _capture(page, reason="navigate")
+                            except Exception:
+                                pass
+
+                        page.on("framenavigated", _on_nav)
+
+                        page.goto(self.base_url, wait_until="domcontentloaded")
+                        self._wait_for_settle(page)
+                        _capture(page, reason="start")
+
+                        if not no_login:
+                            self._login(
+                                page,
+                                mfa_code_provider=mfa_code_provider,
+                                mfa_method=mfa_method,
+                                debug_dir=str(cap_dir),
+                                manual_mfa=manual_mfa,
+                            )
+                            if state_path is not None:
+                                state_path.parent.mkdir(parents=True, exist_ok=True)
+                                ctx.storage_state(path=str(state_path))
+                                self._backup_storage_state(state_path)
+                            _capture(page, reason="after_login")
+
+                        print(
+                            "Browser is open for manual navigation. When finished, either close the tab/window "
+                            "or quit the browser. A debug bundle zip will be created on exit."
+                        )
+
+                        # Wait until either the page closes OR the browser disconnects.
+                        # Some platforms keep the app alive after closing the last window; polling avoids hangs.
+                        while True:
+                            try:
+                                if page.is_closed():
+                                    break
+                            except Exception:
+                                break
+                            try:
+                                if not browser.is_connected():
+                                    break
+                            except Exception:
+                                break
+                            try:
+                                page.wait_for_timeout(500)
+                            except Exception:
+                                break
+                    finally:
+                        try:
+                            ctx.close()
+                        except Exception:
+                            pass
+                finally:
+                    try:
+                        browser.close()
+                    except Exception:
+                        pass
+        except BaseException as e:
+            # Still produce a bundle even if Playwright/browser exits unexpectedly or user Ctrl+C's.
+            err = e
+        finally:
+            try:
+                # Always write a bundle on exit (even if an exception occurred).
+                bundle_path = create_debug_bundle(
+                    debug_dir=str(cap_dir),
+                    log_file=log_file,
+                    out_dir=out_dir,
+                    provider=provider,
+                )
+            except Exception:
+                # If bundling fails, surface the original error if any.
+                if err:
+                    raise
+                raise
+
+        if err:
+            # Preserve Ctrl+C semantics but still return the bundle path via message.
+            if isinstance(err, KeyboardInterrupt):
+                return bundle_path  # type: ignore[return-value]
+            raise RuntimeError(f"browse-portal ended due to error: {err}. Debug bundle: {bundle_path}") from err
+
+        return bundle_path  # type: ignore[return-value]
     def _storage_state_backup_path(self, state_path: Path) -> Path:
         # e.g. data/servicer_storage_state_nelnet.json -> data/servicer_storage_state_nelnet.json.bak
         return state_path.with_name(state_path.name + ".bak")
@@ -341,15 +744,43 @@ class ServicerPortalClient:
                 self._step(page, debug_dir=debug_dir, name="already_logged_in_after_waiting_for_form")
                 return
             self._step(page, debug_dir=debug_dir, name="login_form_visible")
-            frame.locator(self.selectors.username_input).first.fill(self.creds.username)
+
+            def _first_visible(scope, selector: str):
+                loc = scope.locator(selector)
+                try:
+                    n = min(int(loc.count()), 25)
+                except Exception:
+                    n = 0
+                for i in range(n):
+                    cand = loc.nth(i)
+                    try:
+                        if cand.is_visible():
+                            return cand
+                    except Exception:
+                        continue
+                return None
+
+            user_input = _first_visible(frame, self.selectors.username_input)
+            if user_input is None:
+                # Common on portals that render hidden template inputs or gate the login UI behind a disclaimer.
+                self._save_debug(page, debug_dir=debug_dir, name_prefix="login_username_not_visible")
+                raise LoginFormNotFoundError("Login form username field found but none are visible.")
+
+            user_input.fill(self.creds.username)
             self._step(page, debug_dir=debug_dir, name="username_filled")
 
             # Some logins are two-step (username -> next -> password)
-            if frame.locator(self.selectors.password_input).count() == 0:
+            pwd_input = _first_visible(frame, self.selectors.password_input)
+            if pwd_input is None:
                 self._click_first_by_texts(frame, self.selectors.sign_in_submit_texts)
                 self._wait_for_settle(page)
+                pwd_input = _first_visible(frame, self.selectors.password_input)
 
-            frame.locator(self.selectors.password_input).first.fill(self.creds.password)
+            if pwd_input is None:
+                self._save_debug(page, debug_dir=debug_dir, name_prefix="login_password_not_visible")
+                raise LoginFormNotFoundError("Login form password field found but none are visible.")
+
+            pwd_input.fill(self.creds.password)
             self._step(page, debug_dir=debug_dir, name="password_filled")
         except Exception:
             self._save_debug(page, debug_dir=debug_dir, name_prefix="login_failure")
@@ -399,12 +830,61 @@ class ServicerPortalClient:
         # Ensure we truly ended in an authenticated session before proceeding.
         if not self._looks_logged_in(page):
             self._save_debug(page, debug_dir=debug_dir, name_prefix="login_not_completed")
+            reason = self._best_effort_login_failure_reason(page)
+            if reason:
+                raise RuntimeError(reason)
             raise RuntimeError(
                 "Portal login did not complete (not authenticated after credentials/MFA). "
-                "This often indicates the OIDC callback is stuck or a redirect loop occurred."
+                "This may indicate invalid credentials, a redirect loop, or a stuck post-login callback."
             )
 
         self._step(page, debug_dir=debug_dir, name="login_complete")
+
+    def _best_effort_login_failure_reason(self, page: Page) -> Optional[str]:
+        """
+        Try to produce an actionable login failure message from the portal UI.
+
+        This is intentionally conservative: if we can't find a clear message, return None and let the
+        caller raise a generic error (with debug artifacts saved).
+        """
+        try:
+            body = page.inner_text("body")
+        except Exception:
+            body = ""
+
+        txt = (body or "").strip()
+        if not txt:
+            return None
+
+        # Common invalid-credential wording observed on Aidvantage.
+        if re.search(r"can\\s*'\\s*t\\s+find\\s+the\\s+user\\s+id\\s+and\\s+password\\s+combination", txt, re.I):
+            attempts_left = None
+            m = re.search(r"You\\s+have\\s+(\\d+)\\s+more\\s+attempts?", txt, re.I)
+            if m:
+                attempts_left = m.group(1)
+
+            extra = f" (attempts left: {attempts_left})" if attempts_left else ""
+            return (
+                "Login failed: the servicer portal rejected your User ID / Password. "
+                "Double-check SERVICER_USERNAME and SERVICER_PASSWORD and try again."
+                f"{extra}"
+            )
+
+        # Generic invalid/incorrect password messages.
+        if re.search(r"(invalid|incorrect).*(user\\s*id|username|password)", txt, re.I):
+            return (
+                "Login failed: the servicer portal reports your credentials are invalid/incorrect. "
+                "Double-check SERVICER_USERNAME and SERVICER_PASSWORD and try again."
+            )
+
+        # Account lock / throttling hints.
+        if re.search(r"account\\s+will\\s+be\\s+locked|account\\s+locked|too\\s+many\\s+attempts", txt, re.I):
+            return (
+                "Login failed: the portal indicates your account may be locked or you are out of attempts. "
+                "Try logging in manually in a browser to confirm account status, then retry."
+            )
+
+        return None
 
     def _looks_logged_in(self, page: Page) -> bool:
         """
@@ -502,12 +982,28 @@ class ServicerPortalClient:
             if self._looks_logged_in(page):
                 return None
 
-            frame = self._find_frame_with_selector(page, self.selectors.username_input)
+            frame = self._find_frame_with_selector(page, self.selectors.username_input, require_visible=True)
             if frame:
                 return frame
 
             # Ensure consent UI isn't intercepting clicks.
             self._dismiss_cookie_banner(page, timeout_ms=3_000)
+
+            # Some portals gate the login form behind a federal usage disclaimer ("Accept / Decline").
+            # Example: Aidvantage renders the inputs in HTML but hidden until clicking `button#Accept`.
+            try:
+                looks_like_disclaimer = (
+                    page.get_by_text("Please Read Before Continuing", exact=False).count() > 0
+                    or page.get_by_text("Unauthorized use of this information system", exact=False).count() > 0
+                )
+                accept = page.locator(self.selectors.federal_disclaimer_accept_selector)
+                if looks_like_disclaimer and accept.count() > 0 and accept.first.is_visible():
+                    accept.first.click()
+                    self._wait_for_settle(page, timeout_ms=20_000)
+                    self._step(page, debug_dir=debug_dir, name="after_accept_disclaimer")
+                    continue
+            except Exception:
+                pass
 
             # Some flows show a pre-login choice page (Access Your Account vs Make a Payment...).
             if self._maybe_complete_login_choice(page):
@@ -553,7 +1049,7 @@ class ServicerPortalClient:
                 return
 
             try:
-                if self._find_frame_with_selector(page, self.selectors.username_input) is not None:
+                if self._find_frame_with_selector(page, self.selectors.username_input, require_visible=True) is not None:
                     return
             except Exception:
                 pass
@@ -652,11 +1148,22 @@ class ServicerPortalClient:
             logger.debug("Failed while attempting login-choice step; continuing.", exc_info=True)
             return False
 
-    def _find_frame_with_selector(self, page: Page, selector: str) -> Optional[Frame]:
+    def _find_frame_with_selector(self, page: Page, selector: str, *, require_visible: bool = False) -> Optional[Frame]:
         for frame in page.frames:
             try:
-                if frame.locator(selector).count() > 0:
+                loc = frame.locator(selector)
+                if loc.count() <= 0:
+                    continue
+                if not require_visible:
                     return frame
+                # Only consider the selector "present" if at least one match is visible.
+                # Some portals render hidden template inputs behind a disclaimer gate.
+                for i in range(min(int(loc.count()), 25)):
+                    try:
+                        if loc.nth(i).is_visible():
+                            return frame
+                    except Exception:
+                        continue
             except Exception:
                 continue
         return None
@@ -945,7 +1452,14 @@ class ServicerPortalClient:
 
         return False
 
-    def _extract_loans(self, page: Page, *, groups: list[str], debug_dir: str) -> list[LoanSnapshot]:
+    def _extract_loans(
+        self,
+        page: Page,
+        *,
+        groups: list[str],
+        debug_dir: str,
+        allow_empty_loans: bool = False,
+    ) -> list[LoanSnapshot]:
         self._step(page, debug_dir=debug_dir, name="loans_before_nav_my_loans")
         # Race-condition guard: on slower machines the app may still be on the post-login callback screen.
         self._wait_for_post_login_ready(page, debug_dir=debug_dir, timeout_ms=90_000)
@@ -964,6 +1478,12 @@ class ServicerPortalClient:
 
         if not self._wait_for_body_text_contains(page, "Group:", timeout_ms=30_000):
             self._save_debug(page, debug_dir=debug_dir, name_prefix="loan_details_not_loaded")
+            body_text = page.inner_text("body")
+            if allow_empty_loans and self._looks_like_empty_loans_summary(body_text):
+                logger.warning(
+                    "Loan details page shows no active loans (zero balance); skipping loan snapshot extraction."
+                )
+                return []
             raise RuntimeError("Loan details page did not load (missing 'Group:' sections).")
 
         self._step(page, debug_dir=debug_dir, name="loans_after_nav_my_loans")
@@ -973,34 +1493,211 @@ class ServicerPortalClient:
         # Instead, slice the page text per-group and parse within that slice.
         full_text = page.inner_text("body")
 
+        sections = self._extract_all_group_sections(full_text)
+        if not sections:
+            self._save_debug(page, debug_dir=debug_dir, name_prefix="loan_details_no_groups_found")
+            raise RuntimeError("Could not find any 'Group:' sections on the loan details page.")
+
         out: list[LoanSnapshot] = []
         for group in groups:
             try:
                 self._step(page, debug_dir=debug_dir, name=f"loans_before_parse_group_{group}")
-                group_text = self._extract_group_section_text(full_text, group=group)
+                group_text = self._match_group_section_text(sections, group=group)
                 out.append(self._parse_loan_snapshot(group=group, body_text=group_text))
             except Exception:
                 self._save_debug(page, debug_dir=debug_dir, name_prefix=f"loan_{group}_error")
                 raise
         return out
 
+    def _extract_all_group_sections(self, full_text: str) -> list[tuple[str, str, str]]:
+        """
+        Return a list of discovered group sections from the loan-details page.
+
+        Each item is a tuple: (group_token, group_label, section_text)
+        - group_label: the raw text after "Group:" on the header line
+        - group_token: a short ID parsed from the start of group_label (e.g. "AA", "1-01") when possible
+
+        Notes:
+        - Servicers are not consistent about group label formats. We avoid hardcoding AA/AB assumptions.
+        - group_token is best-effort and may be empty if we can't parse a token.
+        """
+        # Find every "Group:" header and slice to the next header (or end of text).
+        matches = list(re.finditer(r"Group:\s*([^\n\r]+)", full_text, flags=re.I))
+        if not matches:
+            return []
+
+        out: list[tuple[str, str, str]] = []
+        for i, m in enumerate(matches):
+            start = m.start()
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(full_text)
+            section_text = full_text[start:end]
+
+            label = (m.group(1) or "").strip()
+            tok_m = re.match(r"([A-Z0-9][A-Z0-9-]{1,31})", label, flags=re.I)
+            token = tok_m.group(1).upper() if tok_m else ""
+
+            out.append((token, label, section_text))
+        return out
+
+    def _looks_like_empty_loans_summary(self, body_text: str) -> bool:
+        """
+        Detect a "no active loans" summary page (no Group sections, zero balance).
+        """
+        t = (body_text or "").casefold()
+        if "group and loan summary" not in t:
+            return False
+        if not re.search(r"current balance\s*:\s*\$?\s*0\.00", t):
+            return False
+        if not re.search(r"current amount due\s*:\s*\$?\s*0\.00", t):
+            return False
+        return True
+
+    def _looks_like_no_recent_payments(self, body_text: str) -> bool:
+        t = (body_text or "").casefold()
+        return "no payments have been made in the last 12 months" in t
+
+    def _looks_like_no_payment_history(self, body_text: str) -> bool:
+        t = (body_text or "").casefold()
+        if "no payments have been made" in t:
+            return True
+        if "no payment history" in t or "no payments found" in t:
+            return True
+        return False
+
+    def _click_payment_history_all(self, page: Page) -> bool:
+        try:
+            selects = page.locator("select")
+            n = min(int(selects.count()), 10)
+            for i in range(n):
+                sel = selects.nth(i)
+                try:
+                    options = [o.strip() for o in sel.locator("option").all_inner_texts()]
+                except Exception:
+                    options = []
+                if any(o.casefold() == "all" for o in options):
+                    sel.select_option(label="All")
+                    self._wait_for_settle(page)
+                    return True
+        except Exception:
+            pass
+
+        for loc in (
+            page.get_by_role("button", name=re.compile(r"Last\s+12\s+Months", re.I)),
+            page.get_by_text("Last 12 Months", exact=True),
+        ):
+            try:
+                n = min(int(loc.count()), 10)
+            except Exception:
+                n = 0
+            for i in range(n):
+                el = loc.nth(i)
+                try:
+                    if not el.is_visible():
+                        continue
+                    el.scroll_into_view_if_needed(timeout=2_000)
+                    el.click(timeout=5_000)
+                    self._wait_for_settle(page)
+                    break
+                except Exception:
+                    continue
+
+        targets = (
+            page.get_by_role("button", name=re.compile(r"^All$", re.I)),
+            page.get_by_role("link", name=re.compile(r"^All$", re.I)),
+            page.get_by_text("All", exact=True),
+        )
+        for loc in targets:
+            try:
+                n = min(int(loc.count()), 10)
+            except Exception:
+                n = 0
+            for i in range(n):
+                el = loc.nth(i)
+                try:
+                    if not el.is_visible():
+                        continue
+                    el.scroll_into_view_if_needed(timeout=2_000)
+                    el.click(timeout=5_000)
+                    self._wait_for_settle(page)
+                    return True
+                except Exception:
+                    continue
+        return False
+
+    def _match_group_section_text(self, sections: list[tuple[str, str, str]], *, group: str) -> str:
+        """
+        Resolve a configured group ID to a discovered section_text.
+
+        Matching strategy:
+        1) token match (configured group == parsed token)
+        2) prefix match (group_label startswith configured group)
+        3) raw label match (configured group == group_label)
+        """
+        g = (group or "").strip()
+        if not g:
+            raise RuntimeError("Empty loan group provided.")
+
+        g_up = g.upper()
+
+        # 1) exact token match
+        for token, label, section_text in sections:
+            if token and token.upper() == g_up:
+                return section_text
+
+        # 2) label prefix match (covers cases like "Group: 1-01 Direct Loan - Subsidized" with group="1-01")
+        for token, label, section_text in sections:
+            if (label or "").strip().upper().startswith(g_up):
+                return section_text
+
+        # 3) raw label match (fallback)
+        for token, label, section_text in sections:
+            if (label or "").strip().upper() == g_up:
+                return section_text
+
+        # Not found: build a helpful error with discovered groups.
+        discovered_tokens = [t for (t, _, _) in sections if t]
+        # De-dupe but preserve order
+        seen: set[str] = set()
+        tokens = []
+        for t in discovered_tokens:
+            if t in seen:
+                continue
+            tokens.append(t)
+            seen.add(t)
+
+        labels = [lbl for (_, lbl, _) in sections if (lbl or "").strip()]
+        labels = labels[:12]  # keep error readable
+
+        hint = ""
+        if tokens:
+            hint = f" Discovered group IDs: {', '.join(tokens)}."
+        elif labels:
+            hint = f" Discovered group labels: {', '.join(labels)}."
+
+        raise RuntimeError(
+            f"Could not locate a loan group section for group={group!r}.{hint} "
+            "Tip: run `studentaid_monarch_sync list-loan-groups` to print a copy/paste LOAN_GROUPS value."
+        )
+
     def _extract_group_section_text(self, full_text: str, *, group: str) -> str:
         """
         Extract the text for a single loan group from the "My Loans" page.
 
-        The UI renders each group section with a header like "Group: AA". We slice from that
-        header to the next "Group:" header (or end of text).
+        The UI renders each group section with a header like "Group: AA" (some servicers
+        include longer identifiers, e.g. "Group: 1-01 Direct Loan - Subsidized").
+        We slice from that header to the next "Group:" header (or end of text).
         """
-        start_match = re.search(rf"Group:\s*{re.escape(group)}\b", full_text)
+        # Case-insensitive: some portals may render labels with mixed case, while config/env
+        # normalization may uppercase tokens.
+        start_match = re.search(rf"Group:\s*{re.escape(group)}\b", full_text, flags=re.I)
         if not start_match:
             raise RuntimeError(f"Could not locate group section header for group={group}")
 
         start = start_match.start()
         remainder = full_text[start_match.end() :]
 
-        # Group codes are typically AA/AB/etc, but keep this aligned with config/env validation (2-8 A-Z/0-9)
-        # so we don't accidentally slice multiple groups together when a servicer uses a different format.
-        next_match = re.search(r"\n\s*Group:\s*[A-Z0-9]{2,8}\b", remainder)
+        # Find the next group header. Do not assume a specific ID format; servicers vary.
+        next_match = re.search(r"\n\s*Group:\s*", remainder, flags=re.I)
         end = start_match.end() + next_match.start() if next_match else len(full_text)
 
         return full_text[start:end]
@@ -1099,6 +1796,7 @@ class ServicerPortalClient:
         debug_dir: str,
         max_payments_to_scan: int,
         payments_since: Optional[date] = None,
+        expected_groups: Optional[set[str]] = None,
     ) -> list[PaymentAllocation]:
         # Best-effort: navigate to payment activity and open the first N payment details.
         self._wait_for_post_login_ready(page, debug_dir=debug_dir, timeout_ms=90_000)
@@ -1110,18 +1808,33 @@ class ServicerPortalClient:
         # These appear as links like "11/26/2025".
         # Payment date entries may be links, buttons, or plain clickable cells depending on UI changes.
         date_re = re.compile(r"^\s*\d{1,2}/\d{1,2}/\d{4}\s*$")
-        date_texts: list[str] = []
-        for loc in (
-            page.get_by_role("link", name=date_re),
-            page.get_by_role("button", name=date_re),
-            page.get_by_text(date_re),
-        ):
-            try:
-                date_texts = [t.strip() for t in loc.all_inner_texts() if t.strip()]
-            except Exception:
-                date_texts = []
-            if date_texts:
-                break
+        def _collect_date_texts() -> list[str]:
+            for loc in (
+                page.get_by_role("link", name=date_re),
+                page.get_by_role("button", name=date_re),
+                page.get_by_text(date_re),
+            ):
+                try:
+                    date_texts = [t.strip() for t in loc.all_inner_texts() if t.strip()]
+                except Exception:
+                    date_texts = []
+                if date_texts:
+                    return date_texts
+            return []
+
+        date_texts = _collect_date_texts()
+        if not date_texts:
+            body_text = page.inner_text("body")
+            if self._looks_like_no_recent_payments(body_text):
+                if self._click_payment_history_all(page):
+                    date_texts = _collect_date_texts()
+                    if not date_texts:
+                        body_text = page.inner_text("body")
+
+            if not date_texts and self._looks_like_no_payment_history(body_text):
+                logger.warning("No payment history entries found; skipping payment allocation extraction.")
+                self._save_debug(page, debug_dir=debug_dir, name_prefix="payment_activity_no_history")
+                return []
 
         if date_texts:
             # Keep order but drop duplicates.
@@ -1169,17 +1882,19 @@ class ServicerPortalClient:
                     self._step(page, debug_dir=debug_dir, name=f"payments_after_open_{idx}_{dt_str}")
 
                     body_text = page.inner_text("body")
-                    allocations.extend(self._parse_payment_allocations(body_text, payment_date=payment_dt))
+                    allocations.extend(
+                        self._parse_payment_allocations(
+                            body_text,
+                            payment_date=payment_dt,
+                            expected_groups=expected_groups,
+                        )
+                    )
                 except Exception:
                     self._save_debug(page, debug_dir=debug_dir, name_prefix=f"payment_detail_{idx}_error")
                     raise
                 finally:
                     # Return to Payment Activity list without relying on browser history.
-                    try:
-                        self._goto_section(page, self.selectors.nav_payment_activity_text, debug_dir=debug_dir)
-                        self._wait_for_settle(page)
-                    except Exception:
-                        self._close_payment_detail(page)
+                    self._close_payment_detail(page)
 
             return allocations
 
@@ -1214,7 +1929,7 @@ class ServicerPortalClient:
                         break
 
                 body_text = page.inner_text("body")
-                parsed = self._parse_payment_allocations(body_text)
+                parsed = self._parse_payment_allocations(body_text, expected_groups=expected_groups)
                 if payments_since and parsed and parsed[0].payment_date < payments_since:
                     logger.info(
                         "Stopping payment scan at %s (older than cutoff %s).",
@@ -1231,7 +1946,12 @@ class ServicerPortalClient:
 
         return allocations
 
-    def _parse_payment_allocations(self, body_text: str, payment_date: Optional[date] = None) -> list[PaymentAllocation]:
+    def _parse_payment_allocations(
+        self,
+        body_text: str,
+        payment_date: Optional[date] = None,
+        expected_groups: Optional[set[str]] = None,
+    ) -> list[PaymentAllocation]:
         # Payment date (prefer caller-provided date from the clicked row to avoid ambiguity)
         if payment_date is None:
             payment_date = self._find_payment_date(body_text)
@@ -1249,22 +1969,27 @@ class ServicerPortalClient:
                 break
 
         lines = [ln.strip() for ln in body_text.splitlines() if ln.strip()]
+        expected = {g.upper() for g in (expected_groups or set())}
 
         group_rows: list[tuple[str, int, int, int]] = []
         total_payment_cents: Optional[int] = None
+        seen_groups: set[str] = set()
 
         for ln in lines:
             # Group rows like: \"AA  $31.20  $19.78  $11.42\"
             m = re.match(
-                r"^([A-Z0-9]{2,8})\s+\$?([\d,]+\.\d{2})\s+\$?([\d,]+\.\d{2})\s+\$?([\d,]+\.\d{2})\s*$",
+                r"^([A-Z0-9][A-Z0-9-]{1,31})\s+\$?([\d,]+\.\d{2})\s+\$?([\d,]+\.\d{2})\s+\$?([\d,]+\.\d{2})\s*$",
                 ln,
             )
             if m:
-                group = m.group(1)
+                group = m.group(1).upper()
+                if group in seen_groups:
+                    continue
                 total_applied = money_to_cents(m.group(2))
                 principal = money_to_cents(m.group(3))
                 interest = money_to_cents(m.group(4))
                 group_rows.append((group, total_applied, principal, interest))
+                seen_groups.add(group)
                 continue
 
             # Total row: \"Total $278.52 $184.12 $94.40\"
@@ -1275,6 +2000,52 @@ class ServicerPortalClient:
             )
             if m2 and total_payment_cents is None:
                 total_payment_cents = money_to_cents(m2.group(1))
+                continue
+
+            # Rows with prefix text: \"Toggle details row AA  $25.71  $14.41  $11.30\"
+            if expected:
+                amounts = re.findall(r"\$?[\d,]+\.\d{2}", ln)
+                if len(amounts) >= 3 and not ln.casefold().startswith("total"):
+                    matched_group = None
+                    for g in expected:
+                        if re.search(rf"\b{re.escape(g)}\b", ln, re.I):
+                            matched_group = g
+                            break
+                    if matched_group and matched_group not in seen_groups:
+                        total_applied = money_to_cents(amounts[-3])
+                        principal = money_to_cents(amounts[-2])
+                        interest = money_to_cents(amounts[-1])
+                        group_rows.append((matched_group, total_applied, principal, interest))
+                        seen_groups.add(matched_group)
+
+        if not group_rows:
+            # Multiline responsive layout: group code then 3 amounts on separate lines.
+            money_re = re.compile(r"^\$?[\d,]+\.\d{2}$")
+            group_re = re.compile(r"^[A-Z0-9][A-Z0-9-]{1,31}$")
+            i = 0
+            while i < len(lines):
+                ln = lines[i]
+                if ln.casefold() == "total" and i + 3 < len(lines):
+                    if money_re.match(lines[i + 1]) and money_re.match(lines[i + 2]) and money_re.match(lines[i + 3]):
+                        if total_payment_cents is None:
+                            total_payment_cents = money_to_cents(lines[i + 1])
+                        i += 4
+                        continue
+
+                if group_re.match(ln) and i + 3 < len(lines):
+                    if money_re.match(lines[i + 1]) and money_re.match(lines[i + 2]) and money_re.match(lines[i + 3]):
+                        group = ln.upper()
+                        if expected and group not in expected:
+                            i += 4
+                            continue
+                        total_applied = money_to_cents(lines[i + 1])
+                        principal = money_to_cents(lines[i + 2])
+                        interest = money_to_cents(lines[i + 3])
+                        group_rows.append((group, total_applied, principal, interest))
+                        i += 4
+                        continue
+
+                i += 1
 
         if not group_rows:
             raise RuntimeError("Could not parse any group allocation rows from payment detail page")
@@ -1317,7 +2088,26 @@ class ServicerPortalClient:
                     page.wait_for_timeout(500)
                     return
             except Exception:
-                continue
+                pass
+
+            try:
+                link = page.get_by_role("link", name=t)
+                if link.count() > 0:
+                    link.first.click()
+                    page.wait_for_timeout(500)
+                    return
+            except Exception:
+                pass
+
+            if len(t) >= 7 or " " in t:
+                try:
+                    txt = page.get_by_text(t, exact=False)
+                    if txt.count() > 0:
+                        txt.first.click()
+                        page.wait_for_timeout(500)
+                        return
+                except Exception:
+                    pass
 
         # Try navigating back to Payment Activity explicitly.
         try:
@@ -1343,35 +2133,141 @@ class ServicerPortalClient:
             pass
 
     def _goto_section(self, page: Page, nav_texts: tuple[str, ...], *, debug_dir: str) -> None:
-        # Try link then button for each nav label.
-        for t in nav_texts:
-            try:
-                link = page.get_by_role("link", name=re.compile(re.escape(t), re.I))
-                if link.count() > 0:
-                    link.first.click()
-                    self._wait_for_settle(page)
-                    return
-            except Exception:
-                pass
-            try:
-                btn = page.get_by_role("button", name=re.compile(re.escape(t), re.I))
-                if btn.count() > 0:
-                    btn.first.click()
-                    self._wait_for_settle(page)
-                    return
-            except Exception:
-                pass
+        """
+        Best-effort navigation helper for a SPA.
 
-            # Fallback: for longer labels (avoid generic ones like "Loans"), try clicking by visible text.
-            if len(t) >= 7 or " " in t:
+        Notes:
+        - Portals often render multiple matching elements (header nav, dashboard cards, footer).
+          Clicking `.first` is brittle; we instead try all candidates.
+        - We prefer candidates that look like real navigation targets:
+          elements with `href` or `routerlink` attributes, and ones whose URL contains words
+          from the nav label (e.g. "payment-activity" for "Payment Activity").
+        - Some labels (e.g. "Payments") may be dropdown toggles (no href/routerlink). We'll click them
+          to expand menus, then re-scan for the real destination links.
+        """
+
+        def _label_words(label: str) -> list[str]:
+            # Keep alphanumerics, split on spaces/punct. Drop very short/common words.
+            raw = re.findall(r"[a-z0-9]+", (label or "").casefold())
+            stop = {"the", "and", "or", "my", "a", "an", "to", "of"}
+            return [w for w in raw if len(w) >= 3 and w not in stop]
+
+        def _candidate_score(*, label: str, href: str, routerlink: str, visible: bool) -> int:
+            target = (href or routerlink or "").strip().casefold()
+            score = 0
+            if href:
+                score += 50
+            if routerlink:
+                score += 50
+            if target:
+                for w in _label_words(label):
+                    if w in target:
+                        score += 10
+            if visible:
+                score += 5
+            else:
+                score -= 100
+            return score
+
+        def _try_locator_group(label: str, loc) -> tuple[bool, bool]:
+            """
+            Try clicking all candidates in a locator group.
+            Returns (navigated, clicked_non_nav):
+            - navigated=True if we successfully clicked a candidate with href/routerlink
+            - clicked_non_nav=True if we clicked something without href/routerlink (likely a menu toggle)
+            """
+            try:
+                n = loc.count()
+            except Exception:
+                return False, False
+
+            # Cap to avoid pathological matches in case a label is too generic.
+            n = min(int(n), 25)
+            if n <= 0:
+                return False, False
+
+            candidates: list[tuple[int, object, str, str]] = []
+            for i in range(n):
+                el = loc.nth(i)
+                href = ""
+                routerlink = ""
+                visible = False
                 try:
-                    cand = page.get_by_text(t, exact=False)
-                    if cand.count() > 0:
-                        cand.first.click()
-                        self._wait_for_settle(page)
-                        return
+                    visible = bool(el.is_visible())
                 except Exception:
-                    pass
+                    visible = False
+                try:
+                    href = (el.get_attribute("href") or "").strip()
+                except Exception:
+                    href = ""
+                try:
+                    # Angular uses `routerlink` (lowercase in HTML), but keep this defensive.
+                    routerlink = (el.get_attribute("routerlink") or el.get_attribute("routerLink") or "").strip()
+                except Exception:
+                    routerlink = ""
+
+                score = _candidate_score(label=label, href=href, routerlink=routerlink, visible=visible)
+                candidates.append((score, el, href, routerlink))
+
+            # Highest score first.
+            candidates.sort(key=lambda x: x[0], reverse=True)
+
+            clicked_non_nav = False
+            for score, el, href, routerlink in candidates:
+                try:
+                    if not el.is_visible():
+                        continue
+                    el.scroll_into_view_if_needed(timeout=2_000)
+                    el.click(timeout=5_000)
+                    self._wait_for_settle(page)
+                    if href or routerlink:
+                        logger.debug(
+                            "Navigation click succeeded (label=%r href=%r routerlink=%r score=%s)",
+                            label,
+                            href,
+                            routerlink,
+                            score,
+                        )
+                        return True, False
+                    # Likely a toggle; allow a rescan so newly visible menu items can be clicked.
+                    logger.debug(
+                        "Clicked non-nav candidate (label=%r; no href/routerlink; score=%s) - will rescan.",
+                        label,
+                        score,
+                    )
+                    clicked_non_nav = True
+                    return False, True
+                except Exception:
+                    continue
+
+            return False, clicked_non_nav
+
+        # Do a few rounds to allow "toggle then click submenu" patterns.
+        for _round in range(3):
+            expanded_menu = False
+            for t in nav_texts:
+                pat = re.compile(re.escape(t), re.I)
+
+                navigated, clicked_non_nav = _try_locator_group(t, page.get_by_role("link", name=pat))
+                if navigated:
+                    return
+                expanded_menu = expanded_menu or clicked_non_nav
+
+                navigated, clicked_non_nav = _try_locator_group(t, page.get_by_role("button", name=pat))
+                if navigated:
+                    return
+                expanded_menu = expanded_menu or clicked_non_nav
+
+                # Fallback: for longer labels, try clicking by visible text (can match custom elements).
+                # We keep this low-impact by still prioritizing candidates with href/routerlink.
+                if len(t) >= 7 or " " in t:
+                    navigated, clicked_non_nav = _try_locator_group(t, page.get_by_text(t, exact=False))
+                    if navigated:
+                        return
+                    expanded_menu = expanded_menu or clicked_non_nav
+
+            if not expanded_menu:
+                break
 
         # If we cannot navigate, dump debug and keep going (caller may still be on correct page).
         logger.warning("Could not navigate using texts=%s; continuing.", nav_texts)

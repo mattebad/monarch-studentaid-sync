@@ -65,6 +65,22 @@ def test_parse_payment_allocations_parses_groups_and_total_and_reference() -> No
     assert aa.interest_applied_cents == 1098
 
 
+def test_parse_payment_allocations_supports_hyphenated_group_ids() -> None:
+    c = _client()
+    body = """
+    Payment Date: 12/26/2025
+
+    1-01  $31.20  $20.22  $10.98
+    1-02  $16.99  $10.61  $6.38
+    Total $48.19 $30.83 $17.36
+    """
+
+    allocs = c._parse_payment_allocations(body)
+    assert len(allocs) == 2
+    assert {a.group for a in allocs} == {"1-01", "1-02"}
+    assert all(a.payment_total_cents == 4819 for a in allocs)
+
+
 def test_parse_payment_allocations_falls_back_to_sum_when_total_missing() -> None:
     c = _client()
     body = """
@@ -76,5 +92,58 @@ def test_parse_payment_allocations_falls_back_to_sum_when_total_missing() -> Non
     allocs = c._parse_payment_allocations(body)
     assert len(allocs) == 2
     assert all(a.payment_total_cents == (3120 + 1699) for a in allocs)
+
+
+def test_parse_payment_allocations_parses_multiline_table_cells() -> None:
+    """
+    Some servicer portals render allocation tables responsively, so each cell becomes its own line.
+    """
+    c = _client()
+    body = """
+    Payment Date: 12/26/2025
+    Confirmation Number: ABCD-1234
+
+    AA
+    $31.20
+    $20.22
+    $10.98
+
+    AB
+    $16.99
+    $10.61
+    $6.38
+
+    Total
+    $278.52
+    $184.12
+    $94.40
+    """
+
+    allocs = c._parse_payment_allocations(body)
+    assert len(allocs) == 2
+    assert {a.group for a in allocs} == {"AA", "AB"}
+    assert all(a.payment_date == date(2025, 12, 26) for a in allocs)
+    assert all(a.payment_reference == "ABCD-1234" for a in allocs)
+    assert all(a.payment_total_cents == 27852 for a in allocs)
+
+
+def test_parse_payment_allocations_parses_row_with_prefix_text_when_expected_groups_given() -> None:
+    """
+    Some table rows include non-group text before the group (e.g. a details-toggle cell).
+    When expected_groups is provided (runtime), we should still extract the correct group + amounts.
+    """
+    c = _client()
+    body = """
+    Payment Date: 12/26/2024
+
+    Toggle details row AA  $25.71  $14.41  $11.30
+    Toggle details row AB  $16.99  $9.52  $7.47
+    """
+
+    allocs = c._parse_payment_allocations(body, expected_groups={"AA", "AB"})
+    assert len(allocs) == 2
+    assert {a.group for a in allocs} == {"AA", "AB"}
+    assert all(a.payment_date == date(2024, 12, 26) for a in allocs)
+    assert all(a.payment_total_cents == (2571 + 1699) for a in allocs)
 
 

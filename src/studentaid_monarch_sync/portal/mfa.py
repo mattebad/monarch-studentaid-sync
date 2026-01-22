@@ -126,25 +126,30 @@ def _try_fetch_code_once(
     print_code: bool,
     checked_msg_ids: set[bytes],
 ) -> Optional[str]:
-    # Re-select in case the server dropped the selected mailbox between polls.
-    sel_status, _ = mail.select(cfg.folder)
-    if sel_status != "OK":
-        raise RuntimeError(f"IMAP select failed for folder={cfg.folder!r}: {sel_status}")
+    try:
+        # Re-select in case the server dropped the selected mailbox between polls.
+        sel_status, _ = mail.select(cfg.folder)
+        if sel_status != "OK":
+            raise RuntimeError(f"IMAP select failed for folder={cfg.folder!r}: {sel_status}")
 
-    # Search ALL so we can still find the message even if Gmail/filter marks it read.
-    search_parts: list[str] = ["ALL"]
-    if cfg.sender_hint:
-        search_parts += ["FROM", f"\"{cfg.sender_hint}\""]
-    # If the user didn't configure a hint, default to the common subject shown on the MFA page.
-    subject = (cfg.subject_hint or "").strip() or "Authorization Code"
-    search_parts += ["SUBJECT", f"\"{subject}\""]
+        # Search ALL so we can still find the message even if Gmail/filter marks it read.
+        search_parts: list[str] = ["ALL"]
+        if cfg.sender_hint:
+            search_parts += ["FROM", f"\"{cfg.sender_hint}\""]
+        # If the user didn't configure a hint, default to the common subject shown on the MFA page.
+        subject = (cfg.subject_hint or "").strip() or "Authorization Code"
+        search_parts += ["SUBJECT", f"\"{subject}\""]
 
-    status, data = mail.search(None, *search_parts)
-    if status != "OK":
-        raise RuntimeError(f"IMAP search failed: {status} {data}")
+        status, data = mail.search(None, *search_parts)
+        if status != "OK":
+            raise RuntimeError(f"IMAP search failed: {status} {data}")
 
-    ids = data[0].split()
-    if not ids:
+        ids = data[0].split()
+        if not ids:
+            return None
+    except Exception:
+        # Treat transient IMAP parsing/search issues as "no code yet"; caller will retry.
+        logger.debug("IMAP fetch attempt failed; treating as no-code.", exc_info=True)
         return None
 
     # Newest first

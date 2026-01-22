@@ -53,6 +53,7 @@ logging:
 
 # Loan groups are configured via `.env` (recommended):
 #   LOAN_GROUPS=AA,AB,AC
+#   LOAN_GROUPS=1-01,1-02
 #
 # Advanced override: you *can* list groups here, but most users shouldn't need to:
 # loans:

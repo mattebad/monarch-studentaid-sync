@@ -17,7 +17,13 @@ logger = logging.getLogger(__name__)
 
 _ENV_VAR_PATTERN = re.compile(r"\$\{([A-Z0-9_]+)\}")
 _PROVIDER_SLUG_RE = re.compile(r"^[a-z0-9-]+$")
-_LOAN_GROUP_RE = re.compile(r"^[A-Z0-9]{2,8}$")
+# Loan "group" identifiers are not standardized across servicers. Many use AA/AB/etc,
+# but some use numeric/hyphen formats like "1-01".
+#
+# We intentionally keep this:
+# - strict enough to avoid accidental junk tokens from `.env`
+# - permissive enough to support common real-world formats
+_LOAN_GROUP_RE = re.compile(r"^[A-Z0-9][A-Z0-9-]{1,31}$")
 
 
 def _expand_env_vars(value: object) -> object:
@@ -102,7 +108,7 @@ def _parse_loan_groups_env(value: str) -> list[str]:
 
     if invalid:
         logger.warning(
-            "Ignoring invalid LOAN_GROUPS tokens: %s (expected group codes like 'AA' matching %s)",
+            "Ignoring invalid LOAN_GROUPS tokens: %s (expected group IDs like 'AA' or '1-01' matching %s)",
             ", ".join(invalid),
             _LOAN_GROUP_RE.pattern,
         )
@@ -233,11 +239,11 @@ class MonarchConfig(BaseModel):
 
     @model_validator(mode="after")
     def _validate_auth(self) -> "MonarchConfig":
-        if self.token:
-            return self
-        if self.email and self.password:
-            return self
-        raise ValueError("Monarch auth requires either monarch.token or monarch.email+monarch.password")
+        # NOTE: We intentionally do NOT hard-fail config loading if Monarch auth is missing.
+        # Some commands (e.g. `list-loan-groups`) only need portal access.
+        #
+        # Commands that require Monarch will validate auth explicitly and raise a clear error.
+        return self
 
 
 class StateConfig(BaseModel):
