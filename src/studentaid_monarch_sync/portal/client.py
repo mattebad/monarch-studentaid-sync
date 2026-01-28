@@ -56,6 +56,7 @@ class ServicerPortalClient:
         self._dark_host = f"dark.{self._canonical_host}" if self._canonical_host else ""
 
         # Step-by-step debug (screenshots) — configured per `extract()` call.
+        self._step_log_enabled: bool = False
         self._step_debug_enabled: bool = False
         self._step_counter: int = 0
         self._step_delay_ms: int = 0
@@ -64,6 +65,7 @@ class ServicerPortalClient:
         self,
         *,
         groups: list[str],
+        skip_loans: bool = False,
         headless: bool = True,
         storage_state_path: str = "data/servicer_storage_state.json",
         debug_dir: str = "data/debug",
@@ -74,12 +76,14 @@ class ServicerPortalClient:
         force_fresh_session: bool = False,
         slow_mo_ms: int = 0,
         step_debug: bool = False,
+        log_steps: bool = False,
         step_delay_ms: int = 0,
         manual_mfa: bool = False,
         allow_empty_loans: bool = False,
     ) -> tuple[list[LoanSnapshot], list[PaymentAllocation]]:
-        # Configure per-run step debug behavior.
-        self._step_debug_enabled = step_debug
+        # Configure per-run step logging/debug behavior.
+        self._step_log_enabled = bool(step_debug or log_steps)
+        self._step_debug_enabled = bool(step_debug)
         self._step_counter = 0
         self._step_delay_ms = int(step_delay_ms or 0)
 
@@ -151,7 +155,26 @@ class ServicerPortalClient:
             )
 
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=headless, slow_mo=int(slow_mo_ms or 0))
+            # Prefer Playwright's bundled Chromium, but fall back to a system-installed browser if the
+            # sandbox/cache doesn't have Playwright browsers available.
+            slow_mo = int(slow_mo_ms or 0)
+            try:
+                browser = p.chromium.launch(headless=headless, slow_mo=slow_mo)
+            except Exception as e:
+                msg = str(e)
+                if "Executable doesn't exist" not in msg and "Executable doesn't exist at" not in msg:
+                    raise
+
+                logger.warning(
+                    "Playwright Chromium executable missing; falling back to system browser channel. (%s)",
+                    msg,
+                )
+
+                # Try Chrome first, then Edge.
+                try:
+                    browser = p.chromium.launch(headless=headless, slow_mo=slow_mo, channel="chrome")
+                except Exception:
+                    browser = p.chromium.launch(headless=headless, slow_mo=slow_mo, channel="msedge")
             try:
                 # Attempt 1: reuse stored session (unless force_fresh_session).
                 # Attempt 2: fresh session (no stored cookies) — helpful when stored state causes
@@ -214,12 +237,16 @@ class ServicerPortalClient:
                             ctx.storage_state(path=str(state_path))
                             self._backup_storage_state(state_path)
 
-                        loans = self._extract_loans(
-                            page,
-                            groups=groups,
-                            debug_dir=debug_dir,
-                            allow_empty_loans=bool(allow_empty_loans),
-                        )
+                        if skip_loans:
+                            logger.info("Skipping loan details extraction (--skip-loans).")
+                            loans: list[LoanSnapshot] = []
+                        else:
+                            loans = self._extract_loans(
+                                page,
+                                groups=groups,
+                                debug_dir=debug_dir,
+                                allow_empty_loans=bool(allow_empty_loans),
+                            )
                         payments = self._extract_payment_allocations(
                             page,
                             groups=groups,
@@ -1042,6 +1069,7 @@ class ServicerPortalClient:
         This is intentionally best-effort (no exception) because portal pages vary; it just reduces race conditions.
         """
         deadline = time.time() + (timeout_ms / 1000)
+        login_cta_re = re.compile(r"^\s*(sign\s*in|log\s*in|login)\s*$", re.I)
         while time.time() < deadline:
             # Keep overlays out of the way while we wait.
             self._dismiss_cookie_banner(page, timeout_ms=3_000)
@@ -1057,6 +1085,19 @@ class ServicerPortalClient:
 
             if self._looks_like_mfa(page):
                 return
+
+            # If a login CTA is present, we already know we're in a "logged out" state.
+            # No need to burn the full timeout just to classify this page.
+            try:
+                if page.get_by_role("button", name=login_cta_re).count() > 0:
+                    return
+            except Exception:
+                pass
+            try:
+                if page.get_by_role("link", name=login_cta_re).count() > 0:
+                    return
+            except Exception:
+                pass
 
             page.wait_for_timeout(500)
 
@@ -1808,6 +1849,17 @@ class ServicerPortalClient:
         self._goto_section(page, self.selectors.nav_payment_activity_text, debug_dir=debug_dir)
         self._step(page, debug_dir=debug_dir, name="payments_after_nav_payment_activity")
 
+        # Best-effort: switch the history filter from "Last 12 Months" to "All" so older payments
+        # are visible when scanning. If this fails, we proceed with the default selection.
+        self._try_select_payment_activity_show_all(page)
+        cancelled_payment_dates: set[date] = set()
+        try:
+            cancelled_payment_dates = self._cancelled_payment_dates_from_payment_activity_text(page.inner_text("body"))
+        except Exception:
+            cancelled_payment_dates = set()
+        if cancelled_payment_dates:
+            logger.info("Detected %d cancelled payment entries; skipping them.", len(cancelled_payment_dates))
+
         # Primary strategy: click the Payment Date links in the history table (they are the most stable entry point).
         # These appear as links like "11/26/2025".
         # Payment date entries may be links, buttons, or plain clickable cells depending on UI changes.
@@ -1853,9 +1905,6 @@ class ServicerPortalClient:
             allocations: list[PaymentAllocation] = []
             opened = 0
             for raw_idx, dt_str in enumerate(ordered_dates):
-                if opened >= max_payments_to_scan:
-                    break
-
                 payment_dt = parse_us_date(dt_str)
                 if payments_since and payment_dt < payments_since:
                     # The Payment Activity list is typically newest-first. Stop scanning once we hit
@@ -1865,6 +1914,13 @@ class ServicerPortalClient:
                         payment_dt.isoformat(),
                         payments_since.isoformat(),
                     )
+                    break
+
+                if payment_dt in cancelled_payment_dates:
+                    logger.info("Skipping cancelled payment entry dated %s.", payment_dt.isoformat())
+                    continue
+
+                if opened >= max_payments_to_scan:
                     break
 
                 idx = opened
@@ -1949,6 +2005,97 @@ class ServicerPortalClient:
                 self._close_payment_detail(page)
 
         return allocations
+
+    def _try_select_payment_activity_show_all(self, page: Page) -> None:
+        """
+        Nelnet's Payment Activity page can default to showing only the last 12 months.
+        Try to switch it to "All" so the date scan sees all available history.
+
+        This is intentionally best-effort and should never raise.
+        """
+        try:
+            # If the page uses a native <select>, this is the most reliable.
+            selects = page.locator("select")
+            for i in range(selects.count()):
+                try:
+                    sel = selects.nth(i)
+                    sel.select_option(label="All")
+                    page.wait_for_timeout(500)
+                    return
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        # Fallback: try clicking an "All" control directly (some UIs render this as a segmented control).
+        for role in ("button", "option", "link"):
+            try:
+                loc = page.get_by_role(role, name=re.compile(r"^All$", re.I))
+                if loc.count() > 0:
+                    loc.first.click()
+                    page.wait_for_timeout(500)
+                    return
+            except Exception:
+                continue
+
+        try:
+            # Last resort: click by exact text. Avoid non-exact matches (e.g. "All Rights Reserved").
+            loc = page.get_by_text("All", exact=True)
+            if loc.count() > 0:
+                loc.first.click()
+                page.wait_for_timeout(500)
+        except Exception:
+            pass
+
+    def _cancelled_payment_dates_from_payment_activity_text(self, body_text: str) -> set[date]:
+        """
+        Parse the Payment Activity list view and find payment dates whose status is "Cancelled".
+
+        This is used to avoid clicking into cancelled entries, since we only want posted/successful
+        payment allocations.
+        """
+        lines = [ln.strip() for ln in (body_text or "").splitlines() if ln.strip()]
+
+        date_start_re = re.compile(r"^(\d{1,2}/\d{1,2}/\d{4})\b")
+        cancelled_word_re = re.compile(r"\bcancel+l?ed\b", re.I)
+
+        def _block_is_cancelled(block_lines: list[str]) -> bool:
+            # Most commonly the status is its own line ("Cancelled"), but some layouts may inline it.
+            for ln in block_lines:
+                if re.fullmatch(r"cancel+l?ed", ln, re.I):
+                    return True
+            for ln in block_lines:
+                if cancelled_word_re.search(ln) and "$" in ln:
+                    return True
+            return False
+
+        out: set[date] = set()
+        current_date: Optional[str] = None
+        current_block: list[str] = []
+
+        for ln in lines:
+            m = date_start_re.match(ln)
+            if m:
+                # Finalize previous block.
+                if current_date and _block_is_cancelled(current_block):
+                    try:
+                        out.add(parse_us_date(current_date))
+                    except Exception:
+                        pass
+                current_date = m.group(1)
+                current_block = [ln]
+                continue
+
+            if current_date is not None:
+                current_block.append(ln)
+
+        if current_date and _block_is_cancelled(current_block):
+            try:
+                out.add(parse_us_date(current_date))
+            except Exception:
+                pass
+
+        return out
 
     def _parse_payment_allocations(
         self,
@@ -2463,9 +2610,9 @@ class ServicerPortalClient:
 
     def _step(self, page: Page, *, debug_dir: str, name: str) -> None:
         """
-        If enabled, save a step-by-step screenshot so the user can see where the flow fails.
+        If enabled, log step-by-step progress and optionally save screenshots.
         """
-        if not self._step_debug_enabled:
+        if not self._step_log_enabled and not self._step_debug_enabled:
             return
 
         self._step_counter += 1
@@ -2473,16 +2620,19 @@ class ServicerPortalClient:
         prefix = f"step_{self._step_counter:02d}_{safe}"
 
         try:
+            logger.info("Step %02d %s (url=%s)", self._step_counter, name, getattr(page, "url", ""))
+        except Exception:
+            pass
+
+        if not self._step_debug_enabled:
+            return
+
+        try:
             out_dir = Path(debug_dir)
             out_dir.mkdir(parents=True, exist_ok=True)
             page.screenshot(path=str(out_dir / f"{prefix}.png"), full_page=True)
         except Exception:
             logger.debug("Failed to save step screenshot (name=%s).", name, exc_info=True)
-
-        try:
-            logger.info("Step %02d %s (url=%s)", self._step_counter, name, getattr(page, "url", ""))
-        except Exception:
-            pass
 
         if self._step_delay_ms > 0:
             try:
