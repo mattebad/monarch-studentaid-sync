@@ -2201,6 +2201,10 @@ class ServicerPortalClient:
             if not raw:
                 return None
 
+            # Group IDs are usually 2-char tokens like "AA", but some servicers render hyphenated IDs
+            # like "1-01". Accept hyphens as long as the token starts with an alphanumeric.
+            group_token_re = r"[A-Z0-9](?:[A-Z0-9-]{1,15})"
+
             # Extract group
             group: Optional[str] = None
             if expected_group_re is not None:
@@ -2209,12 +2213,12 @@ class ServicerPortalClient:
                 mg = expected_group_re.search(raw)
                 if mg:
                     group = mg.group(1).upper()
-            m = re.match(r"^(?:Loan\s+Group|Group)\s*:?\s*([A-Z0-9]{2,8})\b", raw, re.I)
+            m = re.match(rf"^(?:Loan\s+Group|Group)\s*:?\s*({group_token_re})\b", raw, re.I)
             if m:
                 group = m.group(1).upper()
             else:
                 first = raw.split()[0] if raw.split() else ""
-                if re.fullmatch(r"[A-Z0-9]{2,8}", first):
+                if re.fullmatch(group_token_re, first):
                     group = first.upper()
 
             if not group or group == "TOTAL":
@@ -2234,8 +2238,10 @@ class ServicerPortalClient:
             if not raw:
                 return None
 
+            group_token_re = r"[A-Z0-9](?:[A-Z0-9-]{1,15})"
+
             # "Loan Group: AA" or "Group AA"
-            m = re.match(r"^(?:Loan\s+Group|Group)\s*:?\s*([A-Z0-9]{2,8})\s*$", raw, re.I)
+            m = re.match(rf"^(?:Loan\s+Group|Group)\s*:?\s*({group_token_re})\s*$", raw, re.I)
             if m:
                 g = m.group(1).upper()
                 if g != "TOTAL" and (expected_groups is None or g in expected_groups):
@@ -2243,7 +2249,7 @@ class ServicerPortalClient:
                 return None
 
             # Pure group code line (common when the portal renders tables responsively)
-            if re.fullmatch(r"[A-Z0-9]{2,4}", raw):
+            if re.fullmatch(group_token_re, raw):
                 g = raw.upper()
                 if g != "TOTAL" and (expected_groups is None or g in expected_groups):
                     return g
