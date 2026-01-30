@@ -147,3 +147,17 @@ def test_parse_payment_allocations_parses_row_with_prefix_text_when_expected_gro
     assert all(a.payment_total_cents == (2571 + 1699) for a in allocs)
 
 
+def test_payment_activity_cancelled_detection_finds_cancelled_dates() -> None:
+    c = _client()
+    body = """
+    Payment History
+    Payment Date Payment Amount Applied to Principal Applied to Interest Payment Type
+
+    03/01/2025 $10.00 $0.00 $0.00 Canceled
+    02/14/2025 $34,632.04 $0.00 $0.00
+    Cancelled
+    02/13/2025 $34,632.04 $15,606.93 $19,025.11 Electronic
+    """.strip()
+
+    got = c._cancelled_payment_dates_from_payment_activity_text(body)
+    assert got == {date(2025, 3, 1), date(2025, 2, 14)}

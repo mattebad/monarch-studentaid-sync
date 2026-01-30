@@ -56,6 +56,7 @@ class ServicerPortalClient:
         self._dark_host = f"dark.{self._canonical_host}" if self._canonical_host else ""
 
         # Step-by-step debug (screenshots) — configured per `extract()` call.
+        self._step_log_enabled: bool = False
         self._step_debug_enabled: bool = False
         self._step_counter: int = 0
         self._step_delay_ms: int = 0
@@ -64,6 +65,7 @@ class ServicerPortalClient:
         self,
         *,
         groups: list[str],
+        skip_loans: bool = False,
         headless: bool = True,
         storage_state_path: str = "data/servicer_storage_state.json",
         debug_dir: str = "data/debug",
@@ -74,12 +76,14 @@ class ServicerPortalClient:
         force_fresh_session: bool = False,
         slow_mo_ms: int = 0,
         step_debug: bool = False,
+        log_steps: bool = False,
         step_delay_ms: int = 0,
         manual_mfa: bool = False,
         allow_empty_loans: bool = False,
     ) -> tuple[list[LoanSnapshot], list[PaymentAllocation]]:
-        # Configure per-run step debug behavior.
-        self._step_debug_enabled = step_debug
+        # Configure per-run step logging/debug behavior.
+        self._step_log_enabled = bool(step_debug or log_steps)
+        self._step_debug_enabled = bool(step_debug)
         self._step_counter = 0
         self._step_delay_ms = int(step_delay_ms or 0)
 
@@ -151,7 +155,26 @@ class ServicerPortalClient:
             )
 
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=headless, slow_mo=int(slow_mo_ms or 0))
+            # Prefer Playwright's bundled Chromium, but fall back to a system-installed browser if the
+            # sandbox/cache doesn't have Playwright browsers available.
+            slow_mo = int(slow_mo_ms or 0)
+            try:
+                browser = p.chromium.launch(headless=headless, slow_mo=slow_mo)
+            except Exception as e:
+                msg = str(e)
+                if "Executable doesn't exist" not in msg and "Executable doesn't exist at" not in msg:
+                    raise
+
+                logger.warning(
+                    "Playwright Chromium executable missing; falling back to system browser channel. (%s)",
+                    msg,
+                )
+
+                # Try Chrome first, then Edge.
+                try:
+                    browser = p.chromium.launch(headless=headless, slow_mo=slow_mo, channel="chrome")
+                except Exception:
+                    browser = p.chromium.launch(headless=headless, slow_mo=slow_mo, channel="msedge")
             try:
                 # Attempt 1: reuse stored session (unless force_fresh_session).
                 # Attempt 2: fresh session (no stored cookies) — helpful when stored state causes
@@ -214,14 +237,19 @@ class ServicerPortalClient:
                             ctx.storage_state(path=str(state_path))
                             self._backup_storage_state(state_path)
 
-                        loans = self._extract_loans(
-                            page,
-                            groups=groups,
-                            debug_dir=debug_dir,
-                            allow_empty_loans=bool(allow_empty_loans),
-                        )
+                        if skip_loans:
+                            logger.info("Skipping loan details extraction (--skip-loans).")
+                            loans: list[LoanSnapshot] = []
+                        else:
+                            loans = self._extract_loans(
+                                page,
+                                groups=groups,
+                                debug_dir=debug_dir,
+                                allow_empty_loans=bool(allow_empty_loans),
+                            )
                         payments = self._extract_payment_allocations(
                             page,
+                            groups=groups,
                             debug_dir=debug_dir,
                             max_payments_to_scan=max_payments_to_scan,
                             payments_since=payments_since,
@@ -1041,6 +1069,7 @@ class ServicerPortalClient:
         This is intentionally best-effort (no exception) because portal pages vary; it just reduces race conditions.
         """
         deadline = time.time() + (timeout_ms / 1000)
+        login_cta_re = re.compile(r"^\s*(sign\s*in|log\s*in|login)\s*$", re.I)
         while time.time() < deadline:
             # Keep overlays out of the way while we wait.
             self._dismiss_cookie_banner(page, timeout_ms=3_000)
@@ -1056,6 +1085,19 @@ class ServicerPortalClient:
 
             if self._looks_like_mfa(page):
                 return
+
+            # If a login CTA is present, we already know we're in a "logged out" state.
+            # No need to burn the full timeout just to classify this page.
+            try:
+                if page.get_by_role("button", name=login_cta_re).count() > 0:
+                    return
+            except Exception:
+                pass
+            try:
+                if page.get_by_role("link", name=login_cta_re).count() > 0:
+                    return
+            except Exception:
+                pass
 
             page.wait_for_timeout(500)
 
@@ -1793,16 +1835,30 @@ class ServicerPortalClient:
         self,
         page: Page,
         *,
+        groups: list[str],
         debug_dir: str,
         max_payments_to_scan: int,
         payments_since: Optional[date] = None,
         expected_groups: Optional[set[str]] = None,
     ) -> list[PaymentAllocation]:
+        expected_groups = {g.strip().upper() for g in (groups or []) if (g or "").strip()}
+
         # Best-effort: navigate to payment activity and open the first N payment details.
         self._wait_for_post_login_ready(page, debug_dir=debug_dir, timeout_ms=90_000)
         self._step(page, debug_dir=debug_dir, name="payments_before_nav_payment_activity")
         self._goto_section(page, self.selectors.nav_payment_activity_text, debug_dir=debug_dir)
         self._step(page, debug_dir=debug_dir, name="payments_after_nav_payment_activity")
+
+        # Best-effort: switch the history filter from "Last 12 Months" to "All" so older payments
+        # are visible when scanning. If this fails, we proceed with the default selection.
+        self._try_select_payment_activity_show_all(page)
+        cancelled_payment_dates: set[date] = set()
+        try:
+            cancelled_payment_dates = self._cancelled_payment_dates_from_payment_activity_text(page.inner_text("body"))
+        except Exception:
+            cancelled_payment_dates = set()
+        if cancelled_payment_dates:
+            logger.info("Detected %d cancelled payment entries; skipping them.", len(cancelled_payment_dates))
 
         # Primary strategy: click the Payment Date links in the history table (they are the most stable entry point).
         # These appear as links like "11/26/2025".
@@ -1849,9 +1905,6 @@ class ServicerPortalClient:
             allocations: list[PaymentAllocation] = []
             opened = 0
             for raw_idx, dt_str in enumerate(ordered_dates):
-                if opened >= max_payments_to_scan:
-                    break
-
                 payment_dt = parse_us_date(dt_str)
                 if payments_since and payment_dt < payments_since:
                     # The Payment Activity list is typically newest-first. Stop scanning once we hit
@@ -1861,6 +1914,13 @@ class ServicerPortalClient:
                         payment_dt.isoformat(),
                         payments_since.isoformat(),
                     )
+                    break
+
+                if payment_dt in cancelled_payment_dates:
+                    logger.info("Skipping cancelled payment entry dated %s.", payment_dt.isoformat())
+                    continue
+
+                if opened >= max_payments_to_scan:
                     break
 
                 idx = opened
@@ -1886,7 +1946,7 @@ class ServicerPortalClient:
                         self._parse_payment_allocations(
                             body_text,
                             payment_date=payment_dt,
-                            expected_groups=expected_groups,
+                            expected_groups=expected_groups or None,
                         )
                     )
                 except Exception:
@@ -1929,7 +1989,7 @@ class ServicerPortalClient:
                         break
 
                 body_text = page.inner_text("body")
-                parsed = self._parse_payment_allocations(body_text, expected_groups=expected_groups)
+                parsed = self._parse_payment_allocations(body_text, expected_groups=expected_groups or None)
                 if payments_since and parsed and parsed[0].payment_date < payments_since:
                     logger.info(
                         "Stopping payment scan at %s (older than cutoff %s).",
@@ -1946,10 +2006,102 @@ class ServicerPortalClient:
 
         return allocations
 
+    def _try_select_payment_activity_show_all(self, page: Page) -> None:
+        """
+        Nelnet's Payment Activity page can default to showing only the last 12 months.
+        Try to switch it to "All" so the date scan sees all available history.
+
+        This is intentionally best-effort and should never raise.
+        """
+        try:
+            # If the page uses a native <select>, this is the most reliable.
+            selects = page.locator("select")
+            for i in range(selects.count()):
+                try:
+                    sel = selects.nth(i)
+                    sel.select_option(label="All")
+                    page.wait_for_timeout(500)
+                    return
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        # Fallback: try clicking an "All" control directly (some UIs render this as a segmented control).
+        for role in ("button", "option", "link"):
+            try:
+                loc = page.get_by_role(role, name=re.compile(r"^All$", re.I))
+                if loc.count() > 0:
+                    loc.first.click()
+                    page.wait_for_timeout(500)
+                    return
+            except Exception:
+                continue
+
+        try:
+            # Last resort: click by exact text. Avoid non-exact matches (e.g. "All Rights Reserved").
+            loc = page.get_by_text("All", exact=True)
+            if loc.count() > 0:
+                loc.first.click()
+                page.wait_for_timeout(500)
+        except Exception:
+            pass
+
+    def _cancelled_payment_dates_from_payment_activity_text(self, body_text: str) -> set[date]:
+        """
+        Parse the Payment Activity list view and find payment dates whose status is "Cancelled".
+
+        This is used to avoid clicking into cancelled entries, since we only want posted/successful
+        payment allocations.
+        """
+        lines = [ln.strip() for ln in (body_text or "").splitlines() if ln.strip()]
+
+        date_start_re = re.compile(r"^(\d{1,2}/\d{1,2}/\d{4})\b")
+        cancelled_word_re = re.compile(r"\bcancel+l?ed\b", re.I)
+
+        def _block_is_cancelled(block_lines: list[str]) -> bool:
+            # Most commonly the status is its own line ("Cancelled"), but some layouts may inline it.
+            for ln in block_lines:
+                if re.fullmatch(r"cancel+l?ed", ln, re.I):
+                    return True
+            for ln in block_lines:
+                if cancelled_word_re.search(ln) and "$" in ln:
+                    return True
+            return False
+
+        out: set[date] = set()
+        current_date: Optional[str] = None
+        current_block: list[str] = []
+
+        for ln in lines:
+            m = date_start_re.match(ln)
+            if m:
+                # Finalize previous block.
+                if current_date and _block_is_cancelled(current_block):
+                    try:
+                        out.add(parse_us_date(current_date))
+                    except Exception:
+                        pass
+                current_date = m.group(1)
+                current_block = [ln]
+                continue
+
+            if current_date is not None:
+                current_block.append(ln)
+
+        if current_date and _block_is_cancelled(current_block):
+            try:
+                out.add(parse_us_date(current_date))
+            except Exception:
+                pass
+
+        return out
+
     def _parse_payment_allocations(
         self,
         body_text: str,
         payment_date: Optional[date] = None,
+        *,
         expected_groups: Optional[set[str]] = None,
     ) -> list[PaymentAllocation]:
         # Payment date (prefer caller-provided date from the clicked row to avoid ambiguity)
@@ -1975,24 +2127,137 @@ class ServicerPortalClient:
         total_payment_cents: Optional[int] = None
         seen_groups: set[str] = set()
 
-        for ln in lines:
-            # Group rows like: \"AA  $31.20  $19.78  $11.42\"
-            m = re.match(
-                r"^([A-Z0-9][A-Z0-9-]{1,31})\s+\$?([\d,]+\.\d{2})\s+\$?([\d,]+\.\d{2})\s+\$?([\d,]+\.\d{2})\s*$",
-                ln,
-            )
+        money_re = re.compile(r"[-+]?\$?\s*[\d,]+\.\d{2}")
+        expected_group_re: Optional[re.Pattern[str]] = None
+        if expected_groups:
+            # Prefer longer tokens first (defensive; groups are usually 2 chars like "AA").
+            parts = sorted({g.strip().upper() for g in expected_groups if (g or "").strip()}, key=len, reverse=True)
+            if parts:
+                expected_group_re = re.compile(r"\b(" + "|".join(map(re.escape, parts)) + r")\b")
+
+        def _money_amounts(s: str) -> list[int]:
+            vals = money_re.findall(s or "")
+            out: list[int] = []
+            for v in vals:
+                try:
+                    out.append(money_to_cents(v))
+                except Exception:
+                    continue
+            return out
+
+        def _infer_total_principal_interest(amounts: list[int]) -> Optional[tuple[int, int, int]]:
+            """
+            Interpret a list of cents values as (total, principal, interest).
+
+            Supports a few common layouts:
+            - [total, principal, interest]
+            - [principal, interest, total]
+            - [principal, interest]  -> total = principal + interest
+            """
+            amts = [int(a) for a in amounts if a is not None]
+            if not amts:
+                return None
+
+            if len(amts) == 1:
+                return None
+
+            if len(amts) == 2:
+                a, b = amts
+                principal, interest = (a, b)
+                # Heuristic: principal is usually the larger component.
+                if abs(interest) > abs(principal):
+                    principal, interest = interest, principal
+                total = principal + interest
+                return total, principal, interest
+
+            # Use first 3 values by default, but try to infer which one is the total by sum-matching.
+            a, b, c = amts[0], amts[1], amts[2]
+            if a == b + c:
+                return a, b, c
+            if b == a + c:
+                return b, a, c
+            if c == a + b:
+                return c, a, b
+
+            # Fallback: pick the largest as the total, and the remaining as principal/interest.
+            trip = [a, b, c]
+            idx_total = max(range(3), key=lambda i: abs(trip[i]))
+            total = trip[idx_total]
+            rest = [trip[i] for i in range(3) if i != idx_total]
+            principal, interest = rest[0], rest[1]
+            if abs(interest) > abs(principal):
+                principal, interest = interest, principal
+            return total, principal, interest
+
+        def _extract_group_inline_row(ln: str) -> Optional[tuple[str, int, int, int]]:
+            """
+            Parse a single-line allocation row.
+            Accepts formats like:
+              - "AA  $31.20  $20.22  $10.98"
+              - "Loan Group AA  $31.20  $20.22  $10.98"
+              - "Group: AA  $31.20  $20.22  $10.98"
+            """
+            raw = (ln or "").strip()
+            if not raw:
+                return None
+
+            # Group IDs are usually 2-char tokens like "AA", but some servicers render hyphenated IDs
+            # like "1-01". Accept hyphens as long as the token starts with an alphanumeric.
+            group_token_re = r"[A-Z0-9](?:[A-Z0-9-]{1,15})"
+
+            # Extract group
+            group: Optional[str] = None
+            if expected_group_re is not None:
+                # Some layouts include other text before the group (e.g. a "Details" toggle),
+                # so search for an expected group token anywhere in the row.
+                mg = expected_group_re.search(raw)
+                if mg:
+                    group = mg.group(1).upper()
+            m = re.match(rf"^(?:Loan\s+Group|Group)\s*:?\s*({group_token_re})\b", raw, re.I)
             if m:
                 group = m.group(1).upper()
-                if group in seen_groups:
-                    continue
-                total_applied = money_to_cents(m.group(2))
-                principal = money_to_cents(m.group(3))
-                interest = money_to_cents(m.group(4))
-                group_rows.append((group, total_applied, principal, interest))
-                seen_groups.add(group)
-                continue
+            else:
+                first = raw.split()[0] if raw.split() else ""
+                if re.fullmatch(group_token_re, first):
+                    group = first.upper()
 
-            # Total row: \"Total $278.52 $184.12 $94.40\"
+            if not group or group == "TOTAL":
+                return None
+            if expected_groups is not None and group not in expected_groups:
+                return None
+
+            amts = _money_amounts(raw)
+            inferred = _infer_total_principal_interest(amts)
+            if not inferred:
+                return None
+            total, principal, interest = inferred
+            return group, total, principal, interest
+
+        def _is_group_code_only(ln: str) -> Optional[str]:
+            raw = (ln or "").strip()
+            if not raw:
+                return None
+
+            group_token_re = r"[A-Z0-9](?:[A-Z0-9-]{1,15})"
+
+            # "Loan Group: AA" or "Group AA"
+            m = re.match(rf"^(?:Loan\s+Group|Group)\s*:?\s*({group_token_re})\s*$", raw, re.I)
+            if m:
+                g = m.group(1).upper()
+                if g != "TOTAL" and (expected_groups is None or g in expected_groups):
+                    return g
+                return None
+
+            # Pure group code line (common when the portal renders tables responsively)
+            if re.fullmatch(group_token_re, raw):
+                g = raw.upper()
+                if g != "TOTAL" and (expected_groups is None or g in expected_groups):
+                    return g
+            return None
+
+        # Pass 1: parse any obvious inline rows + total row (single line or label+values split across lines).
+        for idx, ln in enumerate(lines):
+            # Total row: "Total $278.52 $184.12 $94.40"
             m2 = re.match(
                 r"^Total\s+\$?([\d,]+\.\d{2})\s+\$?([\d,]+\.\d{2})\s+\$?([\d,]+\.\d{2})\s*$",
                 ln,
@@ -2002,50 +2267,112 @@ class ServicerPortalClient:
                 total_payment_cents = money_to_cents(m2.group(1))
                 continue
 
-            # Rows with prefix text: \"Toggle details row AA  $25.71  $14.41  $11.30\"
-            if expected:
-                amounts = re.findall(r"\$?[\d,]+\.\d{2}", ln)
-                if len(amounts) >= 3 and not ln.casefold().startswith("total"):
-                    matched_group = None
-                    for g in expected:
-                        if re.search(rf"\b{re.escape(g)}\b", ln, re.I):
-                            matched_group = g
-                            break
-                    if matched_group and matched_group not in seen_groups:
-                        total_applied = money_to_cents(amounts[-3])
-                        principal = money_to_cents(amounts[-2])
-                        interest = money_to_cents(amounts[-1])
-                        group_rows.append((matched_group, total_applied, principal, interest))
-                        seen_groups.add(matched_group)
+            # Total label on its own, followed by values on subsequent lines:
+            if total_payment_cents is None and re.fullmatch(r"Total", ln, re.I):
+                for j in range(idx + 1, min(idx + 6, len(lines))):
+                    nxt = lines[j]
+                    amts = _money_amounts(nxt)
+                    if amts:
+                        total_payment_cents = amts[0]
+                        break
 
-        if not group_rows:
-            # Multiline responsive layout: group code then 3 amounts on separate lines.
-            money_re = re.compile(r"^\$?[\d,]+\.\d{2}$")
-            group_re = re.compile(r"^[A-Z0-9][A-Z0-9-]{1,31}$")
-            i = 0
-            while i < len(lines):
-                ln = lines[i]
-                if ln.casefold() == "total" and i + 3 < len(lines):
-                    if money_re.match(lines[i + 1]) and money_re.match(lines[i + 2]) and money_re.match(lines[i + 3]):
-                        if total_payment_cents is None:
-                            total_payment_cents = money_to_cents(lines[i + 1])
-                        i += 4
-                        continue
+            row = _extract_group_inline_row(ln)
+            if row:
+                group_rows.append(row)
 
-                if group_re.match(ln) and i + 3 < len(lines):
-                    if money_re.match(lines[i + 1]) and money_re.match(lines[i + 2]) and money_re.match(lines[i + 3]):
-                        group = ln.upper()
-                        if expected and group not in expected:
-                            i += 4
-                            continue
-                        total_applied = money_to_cents(lines[i + 1])
-                        principal = money_to_cents(lines[i + 2])
-                        interest = money_to_cents(lines[i + 3])
-                        group_rows.append((group, total_applied, principal, interest))
-                        i += 4
-                        continue
-
+        # Pass 2: handle responsive layouts where each cell renders on its own line (group code, then amounts/labels).
+        #
+        # Example:
+        #   AA
+        #   $31.20
+        #   $20.22
+        #   $10.98
+        #
+        # Or:
+        #   Loan Group: AA
+        #   Total Applied
+        #   $31.20
+        #   Principal
+        #   $20.22
+        #   Interest
+        #   $10.98
+        seen_groups: set[str] = {g for (g, _, _, _) in group_rows}
+        i = 0
+        while i < len(lines):
+            g = _is_group_code_only(lines[i])
+            if not g or g in seen_groups:
                 i += 1
+                continue
+
+            # Gather a small block after the group label, stopping if we hit the next group or a Total row.
+            block = []
+            j = i + 1
+            max_lookahead = min(len(lines), i + 18)
+            while j < max_lookahead:
+                ln = lines[j]
+                if _is_group_code_only(ln):
+                    break
+                if re.match(r"^Total\b", ln, re.I):
+                    break
+                block.append(ln)
+                j += 1
+
+            pending_label: Optional[str] = None
+            total_applied: Optional[int] = None
+            principal: Optional[int] = None
+            interest: Optional[int] = None
+            loose_amounts: list[int] = []
+
+            def _label_from_line(s: str) -> Optional[str]:
+                low = (s or "").lower()
+                if "principal" in low:
+                    return "principal"
+                if "interest" in low:
+                    return "interest"
+                if "total" in low and ("applied" in low or "amount" in low or "payment" in low):
+                    return "total"
+                if "total applied" in low:
+                    return "total"
+                return None
+
+            for ln in block:
+                label = _label_from_line(ln)
+                amts = _money_amounts(ln)
+
+                if not amts:
+                    if label:
+                        pending_label = label
+                    continue
+
+                loose_amounts.extend(amts)
+
+                # If the label is in the same line (e.g. "Principal $20.22"), or we saw a label on a prior line.
+                use_label = label or pending_label
+                if use_label and len(amts) == 1:
+                    if use_label == "total" and total_applied is None:
+                        total_applied = amts[0]
+                    elif use_label == "principal" and principal is None:
+                        principal = amts[0]
+                    elif use_label == "interest" and interest is None:
+                        interest = amts[0]
+                    pending_label = None
+
+            # Fallback: infer from the first few amounts found in the block.
+            inferred = _infer_total_principal_interest(loose_amounts)
+            if inferred:
+                inf_total, inf_principal, inf_interest = inferred
+                if total_applied is None:
+                    total_applied = inf_total
+                if principal is None:
+                    principal = inf_principal
+                if interest is None:
+                    interest = inf_interest
+
+            if total_applied is not None and principal is not None and interest is not None:
+                group_rows.append((g, total_applied, principal, interest))
+                seen_groups.add(g)
+
+            i = j if j > i else i + 1
 
         if not group_rows:
             raise RuntimeError("Could not parse any group allocation rows from payment detail page")
@@ -2289,9 +2616,9 @@ class ServicerPortalClient:
 
     def _step(self, page: Page, *, debug_dir: str, name: str) -> None:
         """
-        If enabled, save a step-by-step screenshot so the user can see where the flow fails.
+        If enabled, log step-by-step progress and optionally save screenshots.
         """
-        if not self._step_debug_enabled:
+        if not self._step_log_enabled and not self._step_debug_enabled:
             return
 
         self._step_counter += 1
@@ -2299,16 +2626,19 @@ class ServicerPortalClient:
         prefix = f"step_{self._step_counter:02d}_{safe}"
 
         try:
+            logger.info("Step %02d %s (url=%s)", self._step_counter, name, getattr(page, "url", ""))
+        except Exception:
+            pass
+
+        if not self._step_debug_enabled:
+            return
+
+        try:
             out_dir = Path(debug_dir)
             out_dir.mkdir(parents=True, exist_ok=True)
             page.screenshot(path=str(out_dir / f"{prefix}.png"), full_page=True)
         except Exception:
             logger.debug("Failed to save step screenshot (name=%s).", name, exc_info=True)
-
-        try:
-            logger.info("Step %02d %s (url=%s)", self._step_counter, name, getattr(page, "url", ""))
-        except Exception:
-            pass
 
         if self._step_delay_ms > 0:
             try:

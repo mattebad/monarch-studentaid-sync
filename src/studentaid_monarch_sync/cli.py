@@ -79,6 +79,11 @@ def _build_parser() -> argparse.ArgumentParser:
     sync.add_argument("--slowmo-ms", type=int, default=0, help="Playwright slow motion in milliseconds (debug).")
     sync.add_argument("--step-debug", action="store_true", help="Save step-by-step screenshots under data/debug/.")
     sync.add_argument(
+        "--log-steps",
+        action="store_true",
+        help="Log step-by-step progress without saving screenshots (helps diagnose long pauses).",
+    )
+    sync.add_argument(
         "--step-delay-ms",
         type=int,
         default=0,
@@ -97,6 +102,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--payments-since",
         default="",
         help="Only create payment transactions for payments on/after this date (YYYY-MM-DD).",
+    )
+    sync.add_argument(
+        "--skip-loans",
+        action="store_true",
+        help="Skip loan details/balance extraction (still extracts payment activity allocations). Useful for testing.",
     )
     sync.add_argument(
         "--auto-setup-accounts",
@@ -308,6 +318,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 t_portal = time.time()
                 loan_snapshots, payment_allocations = portal.extract(
                     groups=groups,
+                    skip_loans=bool(args.skip_loans),
                     headless=not args.headful,
                     storage_state_path=storage_state_path,
                     max_payments_to_scan=args.max_payments,
@@ -317,6 +328,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     force_fresh_session=args.fresh_session,
                     slow_mo_ms=args.slowmo_ms,
                     step_debug=args.step_debug,
+                    log_steps=bool(args.log_steps),
                     step_delay_ms=args.step_delay_ms,
                     manual_mfa=args.manual_mfa,
                     allow_empty_loans=args.allow_empty_loans,
