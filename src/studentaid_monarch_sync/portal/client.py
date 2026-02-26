@@ -1852,13 +1852,13 @@ class ServicerPortalClient:
         # Best-effort: switch the history filter from "Last 12 Months" to "All" so older payments
         # are visible when scanning. If this fails, we proceed with the default selection.
         self._try_select_payment_activity_show_all(page)
-        cancelled_payment_dates: set[date] = set()
+        non_posted_dates: dict[date, str] = {}
         try:
-            cancelled_payment_dates = self._cancelled_payment_dates_from_payment_activity_text(page.inner_text("body"))
+            non_posted_dates = self._non_posted_payment_dates_from_payment_activity_text(page.inner_text("body"))
         except Exception:
-            cancelled_payment_dates = set()
-        if cancelled_payment_dates:
-            logger.info("Detected %d cancelled payment entries; skipping them.", len(cancelled_payment_dates))
+            non_posted_dates = {}
+        if non_posted_dates:
+            logger.info("Detected %d non-posted payment entries; skipping them.", len(non_posted_dates))
 
         # Primary strategy: click the Payment Date links in the history table (they are the most stable entry point).
         # These appear as links like "11/26/2025".
@@ -1916,8 +1916,12 @@ class ServicerPortalClient:
                     )
                     break
 
-                if payment_dt in cancelled_payment_dates:
-                    logger.info("Skipping cancelled payment entry dated %s.", payment_dt.isoformat())
+                if payment_dt in non_posted_dates:
+                    logger.info(
+                        "Skipping non-posted payment entry dated %s (status=%s).",
+                        payment_dt.isoformat(),
+                        non_posted_dates[payment_dt],
+                    )
                     continue
 
                 if opened >= max_payments_to_scan:
@@ -1951,11 +1955,19 @@ class ServicerPortalClient:
                     )
                 except Exception:
                     self._save_debug(page, debug_dir=debug_dir, name_prefix=f"payment_detail_{idx}_error")
-                    raise
+                    logger.warning(
+                        "Failed to parse payment detail for date %s (idx=%d); skipping row.",
+                        dt_str, idx, exc_info=True,
+                    )
                 finally:
                     # Return to Payment Activity list without relying on browser history.
                     self._close_payment_detail(page)
 
+            if not allocations and opened > 0:
+                raise RuntimeError(
+                    f"All {opened} payment detail rows failed to parse; aborting. "
+                    "Check debug artifacts (payment_detail_*_error) for details."
+                )
             return allocations
 
         # Gather clickable \"View/Details\" elements.
@@ -2047,41 +2059,45 @@ class ServicerPortalClient:
         except Exception:
             pass
 
-    def _cancelled_payment_dates_from_payment_activity_text(self, body_text: str) -> set[date]:
-        """
-        Parse the Payment Activity list view and find payment dates whose status is "Cancelled".
+    _NON_POSTED_STATUS_RE = re.compile(
+        r"\b(cancel+l?ed|pending|scheduled|processing)\b", re.I
+    )
 
-        This is used to avoid clicking into cancelled entries, since we only want posted/successful
-        payment allocations.
+    def _non_posted_payment_dates_from_payment_activity_text(
+        self, body_text: str
+    ) -> dict[date, str]:
+        """
+        Parse the Payment Activity list view and find payment dates whose status is non-posted
+        (cancelled, pending, scheduled, processing).
+
+        Returns a dict mapping each non-posted date to the matched status keyword so callers
+        can log which status caused the skip.
         """
         lines = [ln.strip() for ln in (body_text or "").splitlines() if ln.strip()]
 
         date_start_re = re.compile(r"^(\d{1,2}/\d{1,2}/\d{4})\b")
-        cancelled_word_re = re.compile(r"\bcancel+l?ed\b", re.I)
 
-        def _block_is_cancelled(block_lines: list[str]) -> bool:
-            # Most commonly the status is its own line ("Cancelled"), but some layouts may inline it.
+        def _non_posted_status(block_lines: list[str]) -> Optional[str]:
             for ln in block_lines:
-                if re.fullmatch(r"cancel+l?ed", ln, re.I):
-                    return True
-            for ln in block_lines:
-                if cancelled_word_re.search(ln) and "$" in ln:
-                    return True
-            return False
+                m = self._NON_POSTED_STATUS_RE.search(ln)
+                if m:
+                    return m.group(1).lower()
+            return None
 
-        out: set[date] = set()
+        out: dict[date, str] = {}
         current_date: Optional[str] = None
         current_block: list[str] = []
 
         for ln in lines:
             m = date_start_re.match(ln)
             if m:
-                # Finalize previous block.
-                if current_date and _block_is_cancelled(current_block):
-                    try:
-                        out.add(parse_us_date(current_date))
-                    except Exception:
-                        pass
+                if current_date:
+                    status = _non_posted_status(current_block)
+                    if status:
+                        try:
+                            out[parse_us_date(current_date)] = status
+                        except Exception:
+                            pass
                 current_date = m.group(1)
                 current_block = [ln]
                 continue
@@ -2089,11 +2105,13 @@ class ServicerPortalClient:
             if current_date is not None:
                 current_block.append(ln)
 
-        if current_date and _block_is_cancelled(current_block):
-            try:
-                out.add(parse_us_date(current_date))
-            except Exception:
-                pass
+        if current_date:
+            status = _non_posted_status(current_block)
+            if status:
+                try:
+                    out[parse_us_date(current_date)] = status
+                except Exception:
+                    pass
 
         return out
 
