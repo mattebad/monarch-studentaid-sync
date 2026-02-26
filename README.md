@@ -240,7 +240,7 @@ Tip: run the exact command once in PowerShell first to confirm it works before s
 
 ### How it works (high level)
 - Logs into your servicer portal (typically `https://{provider}.studentaid.gov`) with Playwright
-- Browser sessions use **stealth defaults** (automation flags disabled, realistic viewport/locale/user-agent, randomized interaction delays) to reduce anti-automation detection
+- Browser sessions use **browser-compatibility defaults** (automation flags disabled, realistic viewport/locale/user-agent, randomized interaction delays) to reduce anti-automation detection
 - When the portal prompts for MFA, selects **Email**, then polls Gmail IMAP for the code
 - Scrapes per-loan balances + payment allocation details
   - **Non-posted payments** (pending, scheduled, processing, cancelled) are automatically detected and skipped — only fully posted payments are synced
