@@ -372,7 +372,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 return 0
             except Exception as e:
                 state.record_run_finish(run_id, ok=False, message=str(e))
-                logger.error("Run failed (run_id=%s ok=false seconds=%.2f)", run_id, time.time() - t0)
+                logger.exception("Run failed (run_id=%s ok=false seconds=%.2f)", run_id, time.time() - t0)
                 raise
             finally:
                 state.close()

@@ -221,3 +221,47 @@ def test_non_posted_detection_mixed_statuses() -> None:
     assert got[date(2026, 2, 15)] == "processing"
     assert got[date(2026, 2, 1)] == "cancelled"
     assert date(2026, 1, 15) not in got
+
+
+def test_payment_history_list_detection_matches_table_view() -> None:
+    c = _client()
+    body = """
+    Payment Activity
+    Payment History
+    Payment Date
+    Payment Amount
+    Applied to Principal
+    Applied to Interest
+    01/26/2026 $278.52 $185.39 $93.13 Auto Debit
+    """.strip()
+
+    assert c._looks_like_payment_history_list(body) is True
+
+
+def test_payment_detail_context_detection_rejects_list_view_text() -> None:
+    c = _client()
+    body = """
+    Payment Activity
+    Payment History
+    Payment Date Payment Amount Applied to Principal Applied to Interest Payment Type
+    01/26/2026 $278.52 $185.39 $93.13 Auto Debit
+    12/26/2025 $278.52 $187.76 $90.76 Auto Debit
+    """.strip()
+
+    assert c._looks_like_payment_detail_context(body, expected_groups={"AA", "AB"}) is False
+
+
+def test_payment_detail_context_detection_accepts_group_breakdown_text() -> None:
+    c = _client()
+    body = """
+    Payment Date: 01/26/2026
+    Loan Group: AA
+    Total Applied
+    $31.20
+    Principal
+    $19.93
+    Interest
+    $11.27
+    """.strip()
+
+    assert c._looks_like_payment_detail_context(body, expected_groups={"AA", "AB"}) is True
