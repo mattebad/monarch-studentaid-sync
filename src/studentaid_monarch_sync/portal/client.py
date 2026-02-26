@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import json
+import random
 import re
 import shutil
 import time
@@ -26,6 +27,13 @@ logger = logging.getLogger(__name__)
 class LoginFormNotFoundError(RuntimeError):
     """
     Raised when we cannot locate the portal login form (username field) after trying common entry points.
+    """
+
+
+class PortalAccessDeniedError(RuntimeError):
+    """
+    Raised when the servicer portal returns HTTP 403 / Access Denied, typically due to
+    anti-automation detection in headless mode.
     """
 
 
@@ -61,6 +69,185 @@ class ServicerPortalClient:
         self._step_counter: int = 0
         self._step_delay_ms: int = 0
 
+        # Tracks whether _launch_browser used a real Chrome channel (affects UA override logic).
+        self._using_real_chrome_channel: bool = False
+
+    # ------------------------------------------------------------------
+    # Shared browser bootstrap helpers (stealth-hardened)
+    # ------------------------------------------------------------------
+
+    _STEALTH_LAUNCH_ARGS = [
+        "--disable-blink-features=AutomationControlled",
+    ]
+
+    _STEALTH_INIT_SCRIPT = r"""
+    (() => {
+      // Mask navigator.webdriver
+      try { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); } catch (_) {}
+
+      // Realistic plugins array (Chrome on Windows/Mac reports at least a few)
+      try {
+        Object.defineProperty(navigator, 'plugins', {
+          get: () => [1, 2, 3, 4, 5],
+        });
+      } catch (_) {}
+
+      // Realistic languages
+      try {
+        Object.defineProperty(navigator, 'languages', {
+          get: () => ['en-US', 'en'],
+        });
+      } catch (_) {}
+
+      // Chrome runtime presence (headless Chrome lacks this)
+      try {
+        if (!window.chrome) { window.chrome = { runtime: {} }; }
+      } catch (_) {}
+
+      // Permissions query normalization
+      try {
+        const originalQuery = window.navigator.permissions?.query;
+        if (originalQuery) {
+          window.navigator.permissions.query = (parameters) =>
+            parameters.name === 'notifications'
+              ? Promise.resolve({ state: Notification.permission })
+              : originalQuery(parameters);
+        }
+      } catch (_) {}
+    })();
+    """
+
+    _CONSENT_DISMISS_SCRIPT = """
+    (() => {
+      const dismiss = () => {
+        try {
+          const accept = Array.from(document.querySelectorAll('button'))
+            .find(b => /accept\\s+all/i.test((b.textContent || '').trim()));
+          if (accept && /this\\s+site\\s+uses\\s+cookies/i.test(document.body?.innerText || '')) {
+            accept.click();
+          }
+        } catch (_) {}
+
+        try {
+          const host = document.getElementById('transcend-consent-manager');
+          const root = host && host.shadowRoot;
+          if (root) {
+            const accept = Array.from(root.querySelectorAll('button'))
+              .find(b => /accept\\s+all/i.test((b.textContent || '').trim()));
+            if (accept) accept.click();
+          }
+        } catch (_) {}
+
+        try {
+          const host = document.getElementById('transcend-consent-manager');
+          if (host) {
+            host.style.setProperty('display', 'none', 'important');
+            host.style.setProperty('pointer-events', 'none', 'important');
+          }
+        } catch (_) {}
+      };
+
+      try {
+        dismiss();
+        new MutationObserver(() => dismiss()).observe(document.documentElement, { childList: true, subtree: true });
+      } catch (_) {}
+    })();
+    """
+
+    def _launch_browser(self, p, *, headless: bool, slow_mo: int):
+        """
+        Launch a Chromium-based browser with stealth hardening.
+
+        Prefers a real Chrome channel (less fingerprintable) over bundled Chromium in headless mode.
+        Falls back through Chrome -> Edge -> bundled Chromium.
+        """
+        args = list(self._STEALTH_LAUNCH_ARGS)
+        launch_kwargs = dict(headless=headless, slow_mo=slow_mo, args=args)
+
+        if headless:
+            # Prefer real Chrome first (better fingerprint), fall back to bundled Chromium.
+            for channel in ("chrome", "msedge", None):
+                try:
+                    kw = {**launch_kwargs}
+                    if channel:
+                        kw["channel"] = channel
+                    browser = p.chromium.launch(**kw)
+                    self._using_real_chrome_channel = channel is not None
+                    return browser
+                except Exception:
+                    continue
+            raise RuntimeError("Could not launch any Chromium-based browser (tried chrome, msedge, bundled).")
+        else:
+            # Headful: try bundled Chromium first (allows devtools), fall back to installed channels.
+            try:
+                browser = p.chromium.launch(**launch_kwargs)
+                self._using_real_chrome_channel = False
+                return browser
+            except Exception as e:
+                msg = str(e)
+                if "Executable doesn't exist" not in msg:
+                    raise
+                logger.warning("Playwright Chromium executable missing; falling back to system browser channel. (%s)", msg)
+                for channel in ("chrome", "msedge"):
+                    try:
+                        browser = p.chromium.launch(**{**launch_kwargs, "channel": channel})
+                        self._using_real_chrome_channel = True
+                        return browser
+                    except Exception:
+                        continue
+                raise
+
+    _REALISTIC_USER_AGENT = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
+    )
+
+    def _create_browser_context(self, browser, *, storage_state: Optional[str] = None):
+        """
+        Create a browser context with realistic fingerprint settings.
+        """
+        ctx_kwargs: dict = {
+            "color_scheme": "light",
+            "viewport": {"width": 1920, "height": 1080},
+            "locale": "en-US",
+            "timezone_id": "America/New_York",
+        }
+        if storage_state:
+            ctx_kwargs["storage_state"] = storage_state
+
+        # Only override user-agent when using bundled Chromium (real Chrome already has a good UA).
+        if not self._using_real_chrome_channel:
+            ctx_kwargs["user_agent"] = self._REALISTIC_USER_AGENT
+
+        return browser.new_context(**ctx_kwargs)
+
+    def _install_context_hooks(self, ctx) -> None:
+        """
+        Install route rewrites, stealth patches, and consent-manager dismissal on a browser context.
+        """
+        # Rewrite the occasionally-seen "dark" host back to the canonical host.
+        try:
+            if self._dark_host and self._canonical_host:
+                def _rewrite(route, request) -> None:
+                    url = request.url
+                    fixed = url.replace(f"://{self._dark_host}", f"://{self._canonical_host}")
+                    route.continue_(url=fixed)
+
+                ctx.route(
+                    re.compile(rf".*://{re.escape(self._dark_host)}/.*", re.I),
+                    _rewrite,
+                )
+        except Exception:
+            logger.debug("Failed to install dark-host rewrite route.", exc_info=True)
+
+        ctx.add_init_script(self._STEALTH_INIT_SCRIPT)
+        ctx.add_init_script(self._CONSENT_DISMISS_SCRIPT)
+
+    def _human_delay(self, page: Page, min_ms: int = 80, max_ms: int = 250) -> None:
+        """Inject a small randomized delay to mimic human interaction timing."""
+        page.wait_for_timeout(random.randint(min_ms, max_ms))
+
     def extract(
         self,
         *,
@@ -90,91 +277,8 @@ class ServicerPortalClient:
         state_path = Path(storage_state_path) if storage_state_path else None
         Path(debug_dir).mkdir(parents=True, exist_ok=True)
 
-        def _install_context_hooks(ctx) -> None:
-            # Rewrite the occasionally-seen "dark" host back to the canonical host.
-            # We have observed headful sessions sometimes ending up on:
-            #   https://dark.<servicer>.studentaid.gov/...
-            # which frequently fails DNS resolution on some machines (NXDOMAIN).
-            try:
-                if not self._dark_host or not self._canonical_host:
-                    raise RuntimeError("canonical host missing")
-
-                def _rewrite(route, request) -> None:
-                    url = request.url
-                    fixed = url.replace(f"://{self._dark_host}", f"://{self._canonical_host}")
-                    route.continue_(url=fixed)
-
-                ctx.route(
-                    re.compile(rf".*://{re.escape(self._dark_host)}/.*", re.I),
-                    _rewrite,
-                )
-            except Exception:
-                logger.debug("Failed to install dark-host rewrite route.", exc_info=True)
-
-            # The portal uses a Transcend consent manager ("This site uses cookies") that can render
-            # inside a shadow root and intercept clicks (including the federal disclaimer).
-            # Install an init script so the consent UI is dismissed/hidden as soon as it mounts.
-            ctx.add_init_script(
-                """
-                (() => {
-                  const dismiss = () => {
-                    // If consent UI is in light DOM, try clicking "Accept all"
-                    try {
-                      const accept = Array.from(document.querySelectorAll('button'))
-                        .find(b => /accept\\s+all/i.test((b.textContent || '').trim()));
-                      if (accept && /this\\s+site\\s+uses\\s+cookies/i.test(document.body?.innerText || '')) {
-                        accept.click();
-                      }
-                    } catch (_) {}
-
-                    // If consent UI is in an OPEN shadow root, try clicking "Accept all"
-                    try {
-                      const host = document.getElementById('transcend-consent-manager');
-                      const root = host && host.shadowRoot;
-                      if (root) {
-                        const accept = Array.from(root.querySelectorAll('button'))
-                          .find(b => /accept\\s+all/i.test((b.textContent || '').trim()));
-                        if (accept) accept.click();
-                      }
-                    } catch (_) {}
-
-                    // Always hide the host so it cannot intercept clicks (works even if shadow root is CLOSED)
-                    try {
-                      const host = document.getElementById('transcend-consent-manager');
-                      if (host) {
-                        host.style.setProperty('display', 'none', 'important');
-                        host.style.setProperty('pointer-events', 'none', 'important');
-                      }
-                    } catch (_) {}
-                  };
-
-                  dismiss();
-                  new MutationObserver(() => dismiss()).observe(document.documentElement, { childList: true, subtree: true });
-                })();
-                """
-            )
-
         with sync_playwright() as p:
-            # Prefer Playwright's bundled Chromium, but fall back to a system-installed browser if the
-            # sandbox/cache doesn't have Playwright browsers available.
-            slow_mo = int(slow_mo_ms or 0)
-            try:
-                browser = p.chromium.launch(headless=headless, slow_mo=slow_mo)
-            except Exception as e:
-                msg = str(e)
-                if "Executable doesn't exist" not in msg and "Executable doesn't exist at" not in msg:
-                    raise
-
-                logger.warning(
-                    "Playwright Chromium executable missing; falling back to system browser channel. (%s)",
-                    msg,
-                )
-
-                # Try Chrome first, then Edge.
-                try:
-                    browser = p.chromium.launch(headless=headless, slow_mo=slow_mo, channel="chrome")
-                except Exception:
-                    browser = p.chromium.launch(headless=headless, slow_mo=slow_mo, channel="msedge")
+            browser = self._launch_browser(p, headless=headless, slow_mo=int(slow_mo_ms or 0))
             try:
                 # Attempt 1: reuse stored session (unless force_fresh_session).
                 # Attempt 2: fresh session (no stored cookies) — helpful when stored state causes
@@ -194,31 +298,24 @@ class ServicerPortalClient:
                     if use_storage and state_path is not None:
                         use_storage = self._validate_or_restore_storage_state(state_path)
 
-                    ctx_kwargs: dict = {}
-                    if use_storage:
-                        ctx_kwargs["storage_state"] = str(state_path)
-
-                    # Force light color scheme.
-                    ctx_kwargs["color_scheme"] = "light"
+                    storage = str(state_path) if use_storage else None
 
                     ctx = None
                     try:
-                        ctx = browser.new_context(**ctx_kwargs)
+                        ctx = self._create_browser_context(browser, storage_state=storage)
                     except Exception as e:
-                        # If storage_state is invalid/corrupt, Playwright can fail before we ever get a Page.
                         if use_storage and state_path is not None:
                             logger.warning(
                                 "Failed to create browser context with stored session; falling back to fresh session. (%s)",
                                 e,
                             )
                             self._quarantine_file(state_path, prefix="storage_state")
-                            ctx_kwargs.pop("storage_state", None)
                             use_storage = False
-                            ctx = browser.new_context(**ctx_kwargs)
+                            ctx = self._create_browser_context(browser, storage_state=None)
                         else:
                             raise
 
-                    _install_context_hooks(ctx)
+                    self._install_context_hooks(ctx)
 
                     page = ctx.new_page()
                     try:
@@ -269,7 +366,8 @@ class ServicerPortalClient:
                                 and isinstance(e, LoginFormNotFoundError)
                                 and not self._looks_logged_in(page)
                             )
-                            if retry_for_browser_error or retry_for_login_form:
+                            retry_for_access_denied = isinstance(e, PortalAccessDeniedError)
+                            if retry_for_browser_error or retry_for_login_form or retry_for_access_denied:
                                 logger.warning(
                                     "Portal navigation/login failed%s; retrying once with a fresh session (no stored cookies).",
                                     " (stored session)" if use_storage else "",
@@ -311,66 +409,8 @@ class ServicerPortalClient:
         state_path = Path(storage_state_path) if storage_state_path else None
         Path(debug_dir).mkdir(parents=True, exist_ok=True)
 
-        def _install_context_hooks(ctx) -> None:
-            # Keep behavior consistent with `extract()`.
-            try:
-                if not self._dark_host or not self._canonical_host:
-                    raise RuntimeError("canonical host missing")
-
-                def _rewrite(route, request) -> None:
-                    url = request.url
-                    fixed = url.replace(f"://{self._dark_host}", f"://{self._canonical_host}")
-                    route.continue_(url=fixed)
-
-                ctx.route(
-                    re.compile(rf".*://{re.escape(self._dark_host)}/.*", re.I),
-                    _rewrite,
-                )
-            except Exception:
-                logger.debug("Failed to install dark-host rewrite route.", exc_info=True)
-
-            ctx.add_init_script(
-                """
-                (() => {
-                  const dismiss = () => {
-                    try {
-                      const accept = Array.from(document.querySelectorAll('button'))
-                        .find(b => /accept\\s+all/i.test((b.textContent || '').trim()));
-                      if (accept && /this\\s+site\\s+uses\\s+cookies/i.test(document.body?.innerText || '')) {
-                        accept.click();
-                      }
-                    } catch (_) {}
-
-                    try {
-                      const host = document.getElementById('transcend-consent-manager');
-                      const root = host && host.shadowRoot;
-                      if (root) {
-                        const accept = Array.from(root.querySelectorAll('button'))
-                          .find(b => /accept\\s+all/i.test((b.textContent || '').trim()));
-                        if (accept) accept.click();
-                      }
-                    } catch (_) {}
-
-                    try {
-                      const host = document.getElementById('transcend-consent-manager');
-                      if (host) {
-                        host.style.setProperty('display', 'none', 'important');
-                        host.style.setProperty('pointer-events', 'none', 'important');
-                      }
-                    } catch (_) {}
-                  };
-
-                  try {
-                    const observer = new MutationObserver(() => dismiss());
-                    observer.observe(document.documentElement, { childList: true, subtree: true });
-                    dismiss();
-                  } catch (_) {}
-                })();
-                """
-            )
-
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=headless, slow_mo=slow_mo_ms)
+            browser = self._launch_browser(p, headless=headless, slow_mo=int(slow_mo_ms or 0))
             try:
                 for attempt_idx in range(2):
                     use_storage = (
@@ -379,14 +419,11 @@ class ServicerPortalClient:
                     if use_storage and state_path is not None:
                         use_storage = self._validate_or_restore_storage_state(state_path)
 
-                    ctx_kwargs: dict = {}
-                    if use_storage:
-                        ctx_kwargs["storage_state"] = str(state_path)
-                    ctx_kwargs["color_scheme"] = "light"
+                    storage = str(state_path) if use_storage else None
 
                     ctx = None
                     try:
-                        ctx = browser.new_context(**ctx_kwargs)
+                        ctx = self._create_browser_context(browser, storage_state=storage)
                     except Exception as e:
                         if use_storage and state_path is not None:
                             logger.warning(
@@ -394,13 +431,12 @@ class ServicerPortalClient:
                                 e,
                             )
                             self._quarantine_file(state_path, prefix="storage_state")
-                            ctx_kwargs.pop("storage_state", None)
                             use_storage = False
-                            ctx = browser.new_context(**ctx_kwargs)
+                            ctx = self._create_browser_context(browser, storage_state=None)
                         else:
                             raise
 
-                    _install_context_hooks(ctx)
+                    self._install_context_hooks(ctx)
 
                     page = ctx.new_page()
                     try:
@@ -456,7 +492,8 @@ class ServicerPortalClient:
                             retry_for_login_form = (
                                 use_storage and isinstance(e, LoginFormNotFoundError) and not self._looks_logged_in(page)
                             )
-                            if retry_for_browser_error or retry_for_login_form:
+                            retry_for_access_denied = isinstance(e, PortalAccessDeniedError)
+                            if retry_for_browser_error or retry_for_login_form or retry_for_access_denied:
                                 logger.warning(
                                     "Portal navigation/login failed%s; retrying once with a fresh session (no stored cookies).",
                                     " (stored session)" if use_storage else "",
@@ -534,61 +571,20 @@ class ServicerPortalClient:
             except Exception:
                 pass
 
-        def _install_context_hooks(ctx) -> None:
-            # Same stability hooks as extract()/discover.
-            try:
-                if self._dark_host and self._canonical_host:
-                    def _rewrite(route, request) -> None:
-                        url = request.url
-                        fixed = url.replace(f"://{self._dark_host}", f"://{self._canonical_host}")
-                        route.continue_(url=fixed)
-
-                    ctx.route(re.compile(rf".*://{re.escape(self._dark_host)}/.*", re.I), _rewrite)
-            except Exception:
-                logger.debug("Failed to install dark-host rewrite route.", exc_info=True)
-
-            ctx.add_init_script(
-                """
-                (() => {
-                  const dismiss = () => {
-                    try {
-                      const accept = Array.from(document.querySelectorAll('button'))
-                        .find(b => /accept\\s+all/i.test((b.textContent || '').trim()));
-                      if (accept && /this\\s+site\\s+uses\\s+cookies/i.test(document.body?.innerText || '')) {
-                        accept.click();
-                      }
-                    } catch (_) {}
-                    try {
-                      const host = document.getElementById('transcend-consent-manager');
-                      if (host) {
-                        host.style.setProperty('display', 'none', 'important');
-                        host.style.setProperty('pointer-events', 'none', 'important');
-                      }
-                    } catch (_) {}
-                  };
-                  try {
-                    const observer = new MutationObserver(() => dismiss());
-                    observer.observe(document.documentElement, { childList: true, subtree: true });
-                    dismiss();
-                  } catch (_) {}
-                })();
-                """
-            )
-
         bundle_path: Optional[Path] = None
         err: Optional[BaseException] = None
         try:
             with sync_playwright() as p:
-                browser = p.chromium.launch(headless=headless, slow_mo=int(slow_mo_ms or 0))
+                browser = self._launch_browser(p, headless=headless, slow_mo=int(slow_mo_ms or 0))
                 try:
-                    ctx_kwargs: dict = {"color_scheme": "light"}
+                    storage = None
                     if state_path and state_path.exists() and not force_fresh_session:
                         if self._validate_or_restore_storage_state(state_path):
-                            ctx_kwargs["storage_state"] = str(state_path)
+                            storage = str(state_path)
 
-                    ctx = browser.new_context(**ctx_kwargs)
+                    ctx = self._create_browser_context(browser, storage_state=storage)
                     try:
-                        _install_context_hooks(ctx)
+                        self._install_context_hooks(ctx)
 
                         page = ctx.new_page()
 
@@ -744,6 +740,7 @@ class ServicerPortalClient:
         try:
             page.goto(self.base_url, wait_until="domcontentloaded")
             self._wait_for_settle(page)
+            self._raise_if_access_denied(page, debug_dir=debug_dir)
             self._step(page, debug_dir=debug_dir, name="after_goto")
             self._dismiss_cookie_banner(page)
             self._step(page, debug_dir=debug_dir, name="after_cookie_dismiss")
@@ -794,7 +791,9 @@ class ServicerPortalClient:
                 self._save_debug(page, debug_dir=debug_dir, name_prefix="login_username_not_visible")
                 raise LoginFormNotFoundError("Login form username field found but none are visible.")
 
+            self._human_delay(page)
             user_input.fill(self.creds.username)
+            self._human_delay(page)
             self._step(page, debug_dir=debug_dir, name="username_filled")
 
             # Some logins are two-step (username -> next -> password)
@@ -808,12 +807,15 @@ class ServicerPortalClient:
                 self._save_debug(page, debug_dir=debug_dir, name_prefix="login_password_not_visible")
                 raise LoginFormNotFoundError("Login form password field found but none are visible.")
 
+            self._human_delay(page)
             pwd_input.fill(self.creds.password)
+            self._human_delay(page)
             self._step(page, debug_dir=debug_dir, name="password_filled")
         except Exception:
             self._save_debug(page, debug_dir=debug_dir, name_prefix="login_failure")
             raise
 
+        self._human_delay(page, min_ms=200, max_ms=500)
         # Try common sign-in patterns by button text (button or link)
         self._click_first_by_texts(page, self.selectors.sign_in_submit_texts)
 
@@ -1494,6 +1496,38 @@ class ServicerPortalClient:
 
         return False
 
+    def _looks_like_access_denied(self, page: Page) -> bool:
+        """
+        Detect HTTP 403 / Access Denied responses that some servicer portals return
+        when anti-automation detection fires (especially in headless mode).
+        """
+        try:
+            body = (page.inner_text("body") or "").strip()
+            if not body or len(body) > 500:
+                return False
+            low = body.lower()
+            if "403" in low and "access denied" in low:
+                return True
+            if "access denied" in low and len(body) < 100:
+                return True
+            if low == "http 403 access denied." or low == "http 403 access denied":
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _raise_if_access_denied(self, page: Page, *, debug_dir: str) -> None:
+        if self._looks_like_access_denied(page):
+            self._save_debug(page, debug_dir=debug_dir, name_prefix="access_denied_403")
+            raise PortalAccessDeniedError(
+                "The servicer portal returned HTTP 403 (Access Denied). This is typically caused by "
+                "anti-automation detection in headless mode. Remediation steps:\n"
+                "  1. Try running with --headful --manual-mfa to establish a trusted session first.\n"
+                "  2. If the issue persists, try --fresh-session to clear stale cookies.\n"
+                "  3. Ensure you are not running from a datacenter IP with poor reputation.\n"
+                "See https://github.com/mattebad/monarch-studentaid-sync/issues/9 for discussion."
+            )
+
     def _extract_loans(
         self,
         page: Page,
@@ -1852,13 +1886,13 @@ class ServicerPortalClient:
         # Best-effort: switch the history filter from "Last 12 Months" to "All" so older payments
         # are visible when scanning. If this fails, we proceed with the default selection.
         self._try_select_payment_activity_show_all(page)
-        cancelled_payment_dates: set[date] = set()
+        non_posted_dates: dict[date, str] = {}
         try:
-            cancelled_payment_dates = self._cancelled_payment_dates_from_payment_activity_text(page.inner_text("body"))
+            non_posted_dates = self._non_posted_payment_dates_from_payment_activity_text(page.inner_text("body"))
         except Exception:
-            cancelled_payment_dates = set()
-        if cancelled_payment_dates:
-            logger.info("Detected %d cancelled payment entries; skipping them.", len(cancelled_payment_dates))
+            non_posted_dates = {}
+        if non_posted_dates:
+            logger.info("Detected %d non-posted payment entries; skipping them.", len(non_posted_dates))
 
         # Primary strategy: click the Payment Date links in the history table (they are the most stable entry point).
         # These appear as links like "11/26/2025".
@@ -1916,8 +1950,12 @@ class ServicerPortalClient:
                     )
                     break
 
-                if payment_dt in cancelled_payment_dates:
-                    logger.info("Skipping cancelled payment entry dated %s.", payment_dt.isoformat())
+                if payment_dt in non_posted_dates:
+                    logger.info(
+                        "Skipping non-posted payment entry dated %s (status=%s).",
+                        payment_dt.isoformat(),
+                        non_posted_dates[payment_dt],
+                    )
                     continue
 
                 if opened >= max_payments_to_scan:
@@ -1930,6 +1968,7 @@ class ServicerPortalClient:
                     self._goto_section(page, self.selectors.nav_payment_activity_text, debug_dir=debug_dir)
                     self._step(page, debug_dir=debug_dir, name=f"payments_before_open_{idx}_{dt_str}")
 
+                    self._human_delay(page, min_ms=150, max_ms=400)
                     # Click the row/date by text (most robust across role changes / shadow DOM).
                     try:
                         page.get_by_role("link", name=dt_str).first.click()
@@ -1951,11 +1990,19 @@ class ServicerPortalClient:
                     )
                 except Exception:
                     self._save_debug(page, debug_dir=debug_dir, name_prefix=f"payment_detail_{idx}_error")
-                    raise
+                    logger.warning(
+                        "Failed to parse payment detail for date %s (idx=%d); skipping row.",
+                        dt_str, idx, exc_info=True,
+                    )
                 finally:
                     # Return to Payment Activity list without relying on browser history.
                     self._close_payment_detail(page)
 
+            if not allocations and opened > 0:
+                raise RuntimeError(
+                    f"All {opened} payment detail rows failed to parse; aborting. "
+                    "Check debug artifacts (payment_detail_*_error) for details."
+                )
             return allocations
 
         # Gather clickable \"View/Details\" elements.
@@ -2047,41 +2094,45 @@ class ServicerPortalClient:
         except Exception:
             pass
 
-    def _cancelled_payment_dates_from_payment_activity_text(self, body_text: str) -> set[date]:
-        """
-        Parse the Payment Activity list view and find payment dates whose status is "Cancelled".
+    _NON_POSTED_STATUS_RE = re.compile(
+        r"\b(cancel+l?ed|pending|scheduled|processing)\b", re.I
+    )
 
-        This is used to avoid clicking into cancelled entries, since we only want posted/successful
-        payment allocations.
+    def _non_posted_payment_dates_from_payment_activity_text(
+        self, body_text: str
+    ) -> dict[date, str]:
+        """
+        Parse the Payment Activity list view and find payment dates whose status is non-posted
+        (cancelled, pending, scheduled, processing).
+
+        Returns a dict mapping each non-posted date to the matched status keyword so callers
+        can log which status caused the skip.
         """
         lines = [ln.strip() for ln in (body_text or "").splitlines() if ln.strip()]
 
         date_start_re = re.compile(r"^(\d{1,2}/\d{1,2}/\d{4})\b")
-        cancelled_word_re = re.compile(r"\bcancel+l?ed\b", re.I)
 
-        def _block_is_cancelled(block_lines: list[str]) -> bool:
-            # Most commonly the status is its own line ("Cancelled"), but some layouts may inline it.
+        def _non_posted_status(block_lines: list[str]) -> Optional[str]:
             for ln in block_lines:
-                if re.fullmatch(r"cancel+l?ed", ln, re.I):
-                    return True
-            for ln in block_lines:
-                if cancelled_word_re.search(ln) and "$" in ln:
-                    return True
-            return False
+                m = self._NON_POSTED_STATUS_RE.search(ln)
+                if m:
+                    return m.group(1).lower()
+            return None
 
-        out: set[date] = set()
+        out: dict[date, str] = {}
         current_date: Optional[str] = None
         current_block: list[str] = []
 
         for ln in lines:
             m = date_start_re.match(ln)
             if m:
-                # Finalize previous block.
-                if current_date and _block_is_cancelled(current_block):
-                    try:
-                        out.add(parse_us_date(current_date))
-                    except Exception:
-                        pass
+                if current_date:
+                    status = _non_posted_status(current_block)
+                    if status:
+                        try:
+                            out[parse_us_date(current_date)] = status
+                        except Exception:
+                            pass
                 current_date = m.group(1)
                 current_block = [ln]
                 continue
@@ -2089,11 +2140,13 @@ class ServicerPortalClient:
             if current_date is not None:
                 current_block.append(ln)
 
-        if current_date and _block_is_cancelled(current_block):
-            try:
-                out.add(parse_us_date(current_date))
-            except Exception:
-                pass
+        if current_date:
+            status = _non_posted_status(current_block)
+            if status:
+                try:
+                    out[parse_us_date(current_date)] = status
+                except Exception:
+                    pass
 
         return out
 
