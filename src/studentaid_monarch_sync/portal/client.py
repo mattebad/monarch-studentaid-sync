@@ -73,24 +73,17 @@ class ServicerPortalClient:
         self._using_real_chrome_channel: bool = False
 
     # ------------------------------------------------------------------
-    # Shared browser bootstrap helpers (stealth-hardened)
+    # Shared browser bootstrap helpers (browser-compatibility hardened)
     # ------------------------------------------------------------------
 
-    _STEALTH_LAUNCH_ARGS = [
+    _BROWSER_COMPAT_LAUNCH_ARGS = [
         "--disable-blink-features=AutomationControlled",
     ]
 
-    _STEALTH_INIT_SCRIPT = r"""
+    _BROWSER_COMPAT_INIT_SCRIPT = r"""
     (() => {
       // Mask navigator.webdriver
       try { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); } catch (_) {}
-
-      // Realistic plugins array (Chrome on Windows/Mac reports at least a few)
-      try {
-        Object.defineProperty(navigator, 'plugins', {
-          get: () => [1, 2, 3, 4, 5],
-        });
-      } catch (_) {}
 
       // Realistic languages
       try {
@@ -156,12 +149,12 @@ class ServicerPortalClient:
 
     def _launch_browser(self, p, *, headless: bool, slow_mo: int):
         """
-        Launch a Chromium-based browser with stealth hardening.
+        Launch a Chromium-based browser with browser compatibility hardening.
 
         Prefers a real Chrome channel (less fingerprintable) over bundled Chromium in headless mode.
         Falls back through Chrome -> Edge -> bundled Chromium.
         """
-        args = list(self._STEALTH_LAUNCH_ARGS)
+        args = list(self._BROWSER_COMPAT_LAUNCH_ARGS)
         launch_kwargs = dict(headless=headless, slow_mo=slow_mo, args=args)
 
         if headless:
@@ -197,7 +190,9 @@ class ServicerPortalClient:
                         continue
                 raise
 
-    _REALISTIC_USER_AGENT = (
+    # Used only when falling back to Playwright's bundled Chromium in headless mode.
+    # Keep the Chrome major version aligned with the Playwright dependency.
+    _BUNDLED_CHROMIUM_USER_AGENT = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/131.0.0.0 Safari/537.36"
@@ -211,20 +206,19 @@ class ServicerPortalClient:
             "color_scheme": "light",
             "viewport": {"width": 1920, "height": 1080},
             "locale": "en-US",
-            "timezone_id": "America/New_York",
         }
         if storage_state:
             ctx_kwargs["storage_state"] = storage_state
 
         # Only override user-agent when using bundled Chromium (real Chrome already has a good UA).
         if not self._using_real_chrome_channel:
-            ctx_kwargs["user_agent"] = self._REALISTIC_USER_AGENT
+            ctx_kwargs["user_agent"] = self._BUNDLED_CHROMIUM_USER_AGENT
 
         return browser.new_context(**ctx_kwargs)
 
     def _install_context_hooks(self, ctx) -> None:
         """
-        Install route rewrites, stealth patches, and consent-manager dismissal on a browser context.
+        Install route rewrites, browser compatibility patches, and consent-manager dismissal on a browser context.
         """
         # Rewrite the occasionally-seen "dark" host back to the canonical host.
         try:
@@ -241,7 +235,7 @@ class ServicerPortalClient:
         except Exception:
             logger.debug("Failed to install dark-host rewrite route.", exc_info=True)
 
-        ctx.add_init_script(self._STEALTH_INIT_SCRIPT)
+        ctx.add_init_script(self._BROWSER_COMPAT_INIT_SCRIPT)
         ctx.add_init_script(self._CONSENT_DISMISS_SCRIPT)
 
     def _human_delay(self, page: Page, min_ms: int = 80, max_ms: int = 250) -> None:
@@ -738,6 +732,17 @@ class ServicerPortalClient:
         manual_mfa: bool = False,
     ) -> None:
         try:
+            # Catch mid-session 403s as well (not just on the initial goto).
+            # Some servicer portals return a bare 403 page with minimal body content.
+            def _on_response(resp) -> None:
+                try:
+                    if resp.status == 403:
+                        self._save_debug(page, debug_dir=debug_dir, name_prefix="access_denied_403_response")
+                except Exception:
+                    pass
+
+            page.on("response", _on_response)
+
             page.goto(self.base_url, wait_until="domcontentloaded")
             self._wait_for_settle(page)
             self._raise_if_access_denied(page, debug_dir=debug_dir)
@@ -791,7 +796,6 @@ class ServicerPortalClient:
                 self._save_debug(page, debug_dir=debug_dir, name_prefix="login_username_not_visible")
                 raise LoginFormNotFoundError("Login form username field found but none are visible.")
 
-            self._human_delay(page)
             user_input.fill(self.creds.username)
             self._human_delay(page)
             self._step(page, debug_dir=debug_dir, name="username_filled")
@@ -807,7 +811,6 @@ class ServicerPortalClient:
                 self._save_debug(page, debug_dir=debug_dir, name_prefix="login_password_not_visible")
                 raise LoginFormNotFoundError("Login form password field found but none are visible.")
 
-            self._human_delay(page)
             pwd_input.fill(self.creds.password)
             self._human_delay(page)
             self._step(page, debug_dir=debug_dir, name="password_filled")
@@ -1509,8 +1512,6 @@ class ServicerPortalClient:
             if "403" in low and "access denied" in low:
                 return True
             if "access denied" in low and len(body) < 100:
-                return True
-            if low == "http 403 access denied." or low == "http 403 access denied":
                 return True
         except Exception:
             pass
