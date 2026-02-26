@@ -190,14 +190,6 @@ class ServicerPortalClient:
                         continue
                 raise
 
-    # Used only when falling back to Playwright's bundled Chromium in headless mode.
-    # Keep the Chrome major version aligned with the Playwright dependency.
-    _BUNDLED_CHROMIUM_USER_AGENT = (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/131.0.0.0 Safari/537.36"
-    )
-
     def _create_browser_context(self, browser, *, storage_state: Optional[str] = None):
         """
         Create a browser context with realistic fingerprint settings.
@@ -206,13 +198,10 @@ class ServicerPortalClient:
             "color_scheme": "light",
             "viewport": {"width": 1920, "height": 1080},
             "locale": "en-US",
+            "extra_http_headers": {"Accept-Language": "en-US,en;q=0.9"},
         }
         if storage_state:
             ctx_kwargs["storage_state"] = storage_state
-
-        # Only override user-agent when using bundled Chromium (real Chrome already has a good UA).
-        if not self._using_real_chrome_channel:
-            ctx_kwargs["user_agent"] = self._BUNDLED_CHROMIUM_USER_AGENT
 
         return browser.new_context(**ctx_kwargs)
 
@@ -734,9 +723,19 @@ class ServicerPortalClient:
         try:
             # Catch mid-session 403s as well (not just on the initial goto).
             # Some servicer portals return a bare 403 page with minimal body content.
+            saw_403_document = {"value": False}
             def _on_response(resp) -> None:
                 try:
                     if resp.status == 403:
+                        # Only treat 403 as fatal when it is for the main document navigation.
+                        # Some portals may return 403 for subresources; failing fast on those
+                        # can create false positives.
+                        try:
+                            req = resp.request
+                            if req.resource_type == "document" and req.frame == page.main_frame:
+                                saw_403_document["value"] = True
+                        except Exception:
+                            pass
                         self._save_debug(page, debug_dir=debug_dir, name_prefix="access_denied_403_response")
                 except Exception:
                     pass
@@ -745,6 +744,9 @@ class ServicerPortalClient:
 
             page.goto(self.base_url, wait_until="domcontentloaded")
             self._wait_for_settle(page)
+            if saw_403_document["value"]:
+                # Prefer failing fast into the retry loop rather than continuing to parse a blocked session.
+                self._raise_if_access_denied(page, debug_dir=debug_dir)
             self._raise_if_access_denied(page, debug_dir=debug_dir)
             self._step(page, debug_dir=debug_dir, name="after_goto")
             self._dismiss_cookie_banner(page)
