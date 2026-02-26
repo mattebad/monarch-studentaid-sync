@@ -61,6 +61,178 @@ class ServicerPortalClient:
         self._step_counter: int = 0
         self._step_delay_ms: int = 0
 
+        # Tracks whether _launch_browser used a real Chrome channel (affects UA override logic).
+        self._using_real_chrome_channel: bool = False
+
+    # ------------------------------------------------------------------
+    # Shared browser bootstrap helpers (browser-compatibility hardened)
+    # ------------------------------------------------------------------
+
+    _BROWSER_COMPAT_LAUNCH_ARGS = [
+        "--disable-blink-features=AutomationControlled",
+    ]
+
+    _BROWSER_COMPAT_INIT_SCRIPT = r"""
+    (() => {
+      // Mask navigator.webdriver
+      try { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); } catch (_) {}
+
+      // Realistic languages
+      try {
+        Object.defineProperty(navigator, 'languages', {
+          get: () => ['en-US', 'en'],
+        });
+      } catch (_) {}
+
+      // Chrome runtime presence (headless Chrome lacks this)
+      try {
+        if (!window.chrome) { window.chrome = { runtime: {} }; }
+      } catch (_) {}
+
+      // Permissions query normalization
+      try {
+        const originalQuery = window.navigator.permissions?.query;
+        if (originalQuery) {
+          window.navigator.permissions.query = (parameters) =>
+            parameters.name === 'notifications'
+              ? Promise.resolve({ state: Notification.permission })
+              : originalQuery(parameters);
+        }
+      } catch (_) {}
+    })();
+    """
+
+    _CONSENT_DISMISS_SCRIPT = """
+    (() => {
+      const dismiss = () => {
+        try {
+          const accept = Array.from(document.querySelectorAll('button'))
+            .find(b => /accept\\s+all/i.test((b.textContent || '').trim()));
+          if (accept && /this\\s+site\\s+uses\\s+cookies/i.test(document.body?.innerText || '')) {
+            accept.click();
+          }
+        } catch (_) {}
+
+        try {
+          const host = document.getElementById('transcend-consent-manager');
+          const root = host && host.shadowRoot;
+          if (root) {
+            const accept = Array.from(root.querySelectorAll('button'))
+              .find(b => /accept\\s+all/i.test((b.textContent || '').trim()));
+            if (accept) accept.click();
+          }
+        } catch (_) {}
+
+        try {
+          const host = document.getElementById('transcend-consent-manager');
+          if (host) {
+            host.style.setProperty('display', 'none', 'important');
+            host.style.setProperty('pointer-events', 'none', 'important');
+          }
+        } catch (_) {}
+      };
+
+      try {
+        dismiss();
+        new MutationObserver(() => dismiss()).observe(document.documentElement, { childList: true, subtree: true });
+      } catch (_) {}
+    })();
+    """
+
+    def _launch_browser(self, p, *, headless: bool, slow_mo: int):
+        """
+        Launch a Chromium-based browser with browser compatibility hardening.
+
+        Prefers a real Chrome channel (less fingerprintable) over bundled Chromium in headless mode.
+        Falls back through Chrome -> Edge -> bundled Chromium.
+        """
+        args = list(self._BROWSER_COMPAT_LAUNCH_ARGS)
+        launch_kwargs = dict(headless=headless, slow_mo=slow_mo, args=args)
+
+        if headless:
+            # Prefer real Chrome first (better fingerprint), fall back to bundled Chromium.
+            for channel in ("chrome", "msedge", None):
+                try:
+                    kw = {**launch_kwargs}
+                    if channel:
+                        kw["channel"] = channel
+                    browser = p.chromium.launch(**kw)
+                    self._using_real_chrome_channel = channel is not None
+                    return browser
+                except Exception:
+                    continue
+            raise RuntimeError("Could not launch any Chromium-based browser (tried chrome, msedge, bundled).")
+        else:
+            # Headful: try bundled Chromium first (allows devtools), fall back to installed channels.
+            try:
+                browser = p.chromium.launch(**launch_kwargs)
+                self._using_real_chrome_channel = False
+                return browser
+            except Exception as e:
+                msg = str(e)
+                if "Executable doesn't exist" not in msg:
+                    raise
+                logger.warning("Playwright Chromium executable missing; falling back to system browser channel. (%s)", msg)
+                for channel in ("chrome", "msedge"):
+                    try:
+                        browser = p.chromium.launch(**{**launch_kwargs, "channel": channel})
+                        self._using_real_chrome_channel = True
+                        return browser
+                    except Exception:
+                        continue
+                raise
+
+    # Used only when falling back to Playwright's bundled Chromium in headless mode.
+    # Keep the Chrome major version aligned with the Playwright dependency.
+    _BUNDLED_CHROMIUM_USER_AGENT = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
+    )
+
+    def _create_browser_context(self, browser, *, storage_state: Optional[str] = None):
+        """
+        Create a browser context with realistic fingerprint settings.
+        """
+        ctx_kwargs: dict = {
+            "color_scheme": "light",
+            "viewport": {"width": 1920, "height": 1080},
+            "locale": "en-US",
+        }
+        if storage_state:
+            ctx_kwargs["storage_state"] = storage_state
+
+        # Only override user-agent when using bundled Chromium (real Chrome already has a good UA).
+        if not self._using_real_chrome_channel:
+            ctx_kwargs["user_agent"] = self._BUNDLED_CHROMIUM_USER_AGENT
+
+        return browser.new_context(**ctx_kwargs)
+
+    def _install_context_hooks(self, ctx) -> None:
+        """
+        Install route rewrites, browser compatibility patches, and consent-manager dismissal on a browser context.
+        """
+        # Rewrite the occasionally-seen "dark" host back to the canonical host.
+        try:
+            if self._dark_host and self._canonical_host:
+                def _rewrite(route, request) -> None:
+                    url = request.url
+                    fixed = url.replace(f"://{self._dark_host}", f"://{self._canonical_host}")
+                    route.continue_(url=fixed)
+
+                ctx.route(
+                    re.compile(rf".*://{re.escape(self._dark_host)}/.*", re.I),
+                    _rewrite,
+                )
+        except Exception:
+            logger.debug("Failed to install dark-host rewrite route.", exc_info=True)
+
+        ctx.add_init_script(self._BROWSER_COMPAT_INIT_SCRIPT)
+        ctx.add_init_script(self._CONSENT_DISMISS_SCRIPT)
+
+    def _human_delay(self, page: Page, min_ms: int = 80, max_ms: int = 250) -> None:
+        """Inject a small randomized delay to mimic human interaction timing."""
+        page.wait_for_timeout(random.randint(min_ms, max_ms))
     def extract(
         self,
         *,
@@ -742,6 +914,17 @@ class ServicerPortalClient:
         manual_mfa: bool = False,
     ) -> None:
         try:
+            # Catch mid-session 403s as well (not just on the initial goto).
+            # Some servicer portals return a bare 403 page with minimal body content.
+            def _on_response(resp) -> None:
+                try:
+                    if resp.status == 403:
+                        self._save_debug(page, debug_dir=debug_dir, name_prefix="access_denied_403_response")
+                except Exception:
+                    pass
+
+            page.on("response", _on_response)
+
             page.goto(self.base_url, wait_until="domcontentloaded")
             self._wait_for_settle(page)
             self._step(page, debug_dir=debug_dir, name="after_goto")
@@ -1494,6 +1677,35 @@ class ServicerPortalClient:
 
         return False
 
+    def _looks_like_access_denied(self, page: Page) -> bool:
+        """
+        Detect HTTP 403 / Access Denied responses that some servicer portals return
+        when anti-automation detection fires (especially in headless mode).
+        """
+        try:
+            body = (page.inner_text("body") or "").strip()
+            if not body or len(body) > 500:
+                return False
+            low = body.lower()
+            if "403" in low and "access denied" in low:
+                return True
+            if "access denied" in low and len(body) < 100:
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _raise_if_access_denied(self, page: Page, *, debug_dir: str) -> None:
+        if self._looks_like_access_denied(page):
+            self._save_debug(page, debug_dir=debug_dir, name_prefix="access_denied_403")
+            raise PortalAccessDeniedError(
+                "The servicer portal returned HTTP 403 (Access Denied). This is typically caused by "
+                "anti-automation detection in headless mode. Remediation steps:\n"
+                "  1. Try running with --headful --manual-mfa to establish a trusted session first.\n"
+                "  2. If the issue persists, try --fresh-session to clear stale cookies.\n"
+                "  3. Ensure you are not running from a datacenter IP with poor reputation.\n"
+                "See https://github.com/mattebad/monarch-studentaid-sync/issues/9 for discussion."
+            )
     def _extract_loans(
         self,
         page: Page,
