@@ -221,8 +221,6 @@ def test_non_posted_detection_mixed_statuses() -> None:
     assert got[date(2026, 2, 15)] == "processing"
     assert got[date(2026, 2, 1)] == "cancelled"
     assert date(2026, 1, 15) not in got
-
-
 def test_payment_history_list_detection_matches_table_view() -> None:
     c = _client()
     body = """
