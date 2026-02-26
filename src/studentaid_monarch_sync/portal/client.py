@@ -1640,6 +1640,43 @@ class ServicerPortalClient:
             return True
         return False
 
+    def _looks_like_payment_history_list(self, body_text: str) -> bool:
+        """
+        Detect the Payment Activity list/table view (not a payment detail breakdown).
+        """
+        t = (body_text or "").casefold()
+        if "payment history" not in t:
+            return False
+        if "payment date" in t and "payment amount" in t and "applied to principal" in t:
+            return True
+        return False
+
+    def _looks_like_payment_detail_context(
+        self, body_text: str, *, expected_groups: Optional[set[str]] = None
+    ) -> bool:
+        """
+        Detect whether page text appears to be a payment detail context with group-level allocations.
+
+        We intentionally avoid relying on generic labels like "Applied to Principal" because
+        those also appear in informational side panels on the list page.
+        """
+        text = body_text or ""
+        if not text.strip():
+            return False
+
+        # Strong signal: expected group token appears in detail text.
+        expected = {g.strip().upper() for g in (expected_groups or set()) if (g or "").strip()}
+        if expected:
+            token_re = re.compile(r"\b(" + "|".join(map(re.escape, sorted(expected, key=len, reverse=True))) + r")\b")
+            if token_re.search(text):
+                return True
+
+        # Generic fallback when expected groups are unavailable.
+        if re.search(r"\b(?:Loan\s+Group|Group)\b", text, re.I):
+            if re.search(r"\$\s*[\d,]+\.\d{2}", text):
+                return True
+        return False
+
     def _click_payment_history_all(self, page: Page) -> bool:
         try:
             selects = page.locator("select")
@@ -1699,6 +1736,65 @@ class ServicerPortalClient:
                 except Exception:
                     continue
         return False
+
+    def _click_payment_date_entry(self, page: Page, dt_str: str, *, details_link_first: bool = False) -> None:
+        """
+        Click a Payment History date entry using multiple strategies.
+
+        `details_link_first=True` prioritizes the known CRI table anchor selector.
+        """
+        esc_dt = re.escape(dt_str)
+        details_link = page.locator("a.detailsLink").filter(has_text=re.compile(rf"^\s*{esc_dt}\s*$"))
+        role_link = page.get_by_role("link", name=re.compile(rf"^\s*{esc_dt}\s*$"))
+        role_button = page.get_by_role("button", name=re.compile(rf"^\s*{esc_dt}\s*$"))
+        exact_text = page.get_by_text(dt_str, exact=True)
+
+        candidates = (
+            (details_link, role_link, role_button, exact_text)
+            if details_link_first
+            else (role_link, role_button, details_link, exact_text)
+        )
+
+        for loc in candidates:
+            try:
+                if loc.count() == 0:
+                    continue
+                el = loc.first
+                try:
+                    el.scroll_into_view_if_needed(timeout=2_000)
+                except Exception:
+                    pass
+                el.click(timeout=5_000)
+                return
+            except Exception:
+                continue
+
+        raise RuntimeError(f"Could not click payment date entry: {dt_str}")
+
+    def _wait_for_payment_detail_context(
+        self,
+        page: Page,
+        *,
+        expected_groups: Optional[set[str]] = None,
+        timeout_ms: int = 6_000,
+    ) -> str:
+        """
+        Poll briefly for payment detail content to appear after clicking a payment date.
+        Returns the latest body text (detail or list).
+        """
+        deadline = time.time() + (timeout_ms / 1000.0)
+        latest = ""
+        while time.time() < deadline:
+            try:
+                latest = page.inner_text("body")
+            except Exception:
+                latest = ""
+
+            if self._looks_like_payment_detail_context(latest, expected_groups=expected_groups):
+                return latest
+
+            page.wait_for_timeout(250)
+        return latest
 
     def _match_group_section_text(self, sections: list[tuple[str, str, str]], *, group: str) -> str:
         """
@@ -1937,7 +2033,8 @@ class ServicerPortalClient:
                 ordered_dates.append(t)
 
             allocations: list[PaymentAllocation] = []
-            opened = 0
+            opened_rows = 0
+            parsed_rows = 0
             for raw_idx, dt_str in enumerate(ordered_dates):
                 payment_dt = parse_us_date(dt_str)
                 if payments_since and payment_dt < payments_since:
@@ -1958,29 +2055,49 @@ class ServicerPortalClient:
                     )
                     continue
 
-                if opened >= max_payments_to_scan:
+                if opened_rows >= max_payments_to_scan:
                     break
 
-                idx = opened
-                opened += 1
+                idx = opened_rows
+                opened_rows += 1
                 try:
                     # Ensure we're on the Payment Activity list before each click.
                     self._goto_section(page, self.selectors.nav_payment_activity_text, debug_dir=debug_dir)
                     self._step(page, debug_dir=debug_dir, name=f"payments_before_open_{idx}_{dt_str}")
 
                     self._human_delay(page, min_ms=150, max_ms=400)
-                    # Click the row/date by text (most robust across role changes / shadow DOM).
-                    try:
-                        page.get_by_role("link", name=dt_str).first.click()
-                    except Exception:
-                        try:
-                            page.get_by_role("button", name=dt_str).first.click()
-                        except Exception:
-                            page.get_by_text(dt_str, exact=True).first.click()
+                    # First attempt: role/text-driven click.
+                    self._click_payment_date_entry(page, dt_str, details_link_first=False)
                     self._wait_for_settle(page)
-                    self._step(page, debug_dir=debug_dir, name=f"payments_after_open_{idx}_{dt_str}")
+                    body_text = self._wait_for_payment_detail_context(
+                        page,
+                        expected_groups=expected_groups or None,
+                    )
 
-                    body_text = page.inner_text("body")
+                    # Retry once with explicit table-anchor selector when detail content didn't appear.
+                    if not self._looks_like_payment_detail_context(body_text, expected_groups=expected_groups or None):
+                        logger.warning(
+                            "Payment detail did not open for date %s on first click; retrying via detailsLink.",
+                            dt_str,
+                        )
+                        self._click_payment_date_entry(page, dt_str, details_link_first=True)
+                        self._wait_for_settle(page)
+                        body_text = self._wait_for_payment_detail_context(
+                            page,
+                            expected_groups=expected_groups or None,
+                        )
+
+                    if not self._looks_like_payment_detail_context(body_text, expected_groups=expected_groups or None):
+                        self._save_debug(page, debug_dir=debug_dir, name_prefix=f"payment_detail_{idx}_not_opened")
+                        logger.warning(
+                            "Payment detail never reached parseable state for date %s (idx=%d); skipping row.",
+                            dt_str,
+                            idx,
+                        )
+                        continue
+
+                    parsed_rows += 1
+                    self._step(page, debug_dir=debug_dir, name=f"payments_after_open_{idx}_{dt_str}")
                     allocations.extend(
                         self._parse_payment_allocations(
                             body_text,
@@ -1998,10 +2115,16 @@ class ServicerPortalClient:
                     # Return to Payment Activity list without relying on browser history.
                     self._close_payment_detail(page)
 
-            if not allocations and opened > 0:
+            if not allocations and parsed_rows > 0:
                 raise RuntimeError(
-                    f"All {opened} payment detail rows failed to parse; aborting. "
+                    f"All {parsed_rows} parseable payment detail rows failed to parse; aborting. "
                     "Check debug artifacts (payment_detail_*_error) for details."
+                )
+            if not allocations and opened_rows > 0 and parsed_rows == 0:
+                logger.warning(
+                    "Opened %d payment rows but none reached a parseable detail view; "
+                    "continuing without payment allocations for this run.",
+                    opened_rows,
                 )
             return allocations
 
@@ -2025,9 +2148,12 @@ class ServicerPortalClient:
 
         allocations: list[PaymentAllocation] = []
         count = min(openers.count(), max_payments_to_scan)
+        opened_rows = 0
+        parsed_rows = 0
         for idx in range(count):
             try:
                 openers.nth(idx).click()
+                opened_rows += 1
                 page.wait_for_timeout(750)
 
                 # Wait for details page to contain expected text.
@@ -2035,7 +2161,19 @@ class ServicerPortalClient:
                     if page.get_by_text(ready_text, exact=False).count() > 0:
                         break
 
-                body_text = page.inner_text("body")
+                body_text = self._wait_for_payment_detail_context(
+                    page,
+                    expected_groups=expected_groups or None,
+                )
+                if not self._looks_like_payment_detail_context(body_text, expected_groups=expected_groups or None):
+                    self._save_debug(page, debug_dir=debug_dir, name_prefix=f"payment_detail_{idx}_not_opened")
+                    logger.warning(
+                        "Fallback opener did not reach parseable payment detail state (idx=%d); skipping row.",
+                        idx,
+                    )
+                    continue
+
+                parsed_rows += 1
                 parsed = self._parse_payment_allocations(body_text, expected_groups=expected_groups or None)
                 if payments_since and parsed and parsed[0].payment_date < payments_since:
                     logger.info(
@@ -2047,10 +2185,25 @@ class ServicerPortalClient:
                 allocations.extend(parsed)
             except Exception:
                 self._save_debug(page, debug_dir=debug_dir, name_prefix=f"payment_detail_{idx}_error")
-                raise
+                logger.warning(
+                    "Failed to parse payment detail from fallback opener (idx=%d); skipping row.",
+                    idx,
+                    exc_info=True,
+                )
             finally:
                 self._close_payment_detail(page)
 
+        if not allocations and parsed_rows > 0:
+            raise RuntimeError(
+                f"All {parsed_rows} parseable payment detail rows failed to parse; aborting. "
+                "Check debug artifacts (payment_detail_*_error) for details."
+            )
+        if not allocations and opened_rows > 0 and parsed_rows == 0:
+            logger.warning(
+                "Fallback opener clicked %d rows but none reached parseable detail view; "
+                "continuing without payment allocations for this run.",
+                opened_rows,
+            )
         return allocations
 
     def _try_select_payment_activity_show_all(self, page: Page) -> None:
