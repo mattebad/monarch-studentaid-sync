@@ -15,6 +15,15 @@ def _client() -> ServicerPortalClient:
     )
 
 
+class _BodyOnlyPage:
+    def __init__(self, body_text: str) -> None:
+        self._body_text = body_text
+
+    def inner_text(self, selector: str) -> str:
+        assert selector == "body"
+        return self._body_text
+
+
 def test_parse_us_date_basic() -> None:
     assert parse_us_date("12/26/2025") == date(2025, 12, 26)
 
@@ -221,6 +230,8 @@ def test_non_posted_detection_mixed_statuses() -> None:
     assert got[date(2026, 2, 15)] == "processing"
     assert got[date(2026, 2, 1)] == "cancelled"
     assert date(2026, 1, 15) not in got
+
+
 def test_payment_history_list_detection_matches_table_view() -> None:
     c = _client()
     body = """
@@ -263,3 +274,21 @@ def test_payment_detail_context_detection_accepts_group_breakdown_text() -> None
     """.strip()
 
     assert c._looks_like_payment_detail_context(body, expected_groups={"AA", "AB"}) is True
+
+
+def test_looks_like_access_denied_matches_403_text() -> None:
+    c = _client()
+    page = _BodyOnlyPage("HTTP 403 Access denied.")
+    assert c._looks_like_access_denied(page) is True
+
+
+def test_looks_like_access_denied_matches_short_access_denied_text() -> None:
+    c = _client()
+    page = _BodyOnlyPage("Access denied")
+    assert c._looks_like_access_denied(page) is True
+
+
+def test_looks_like_access_denied_ignores_normal_page_content() -> None:
+    c = _client()
+    page = _BodyOnlyPage("Welcome back. Payment Activity is ready.")
+    assert c._looks_like_access_denied(page) is False
