@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import json
+import random
 import re
 import shutil
 import time
@@ -26,6 +27,12 @@ logger = logging.getLogger(__name__)
 class LoginFormNotFoundError(RuntimeError):
     """
     Raised when we cannot locate the portal login form (username field) after trying common entry points.
+    """
+
+
+class PortalAccessDeniedError(RuntimeError):
+    """
+    Raised when the servicer portal returns HTTP 403 / Access Denied.
     """
 
 
@@ -61,6 +68,221 @@ class ServicerPortalClient:
         self._step_counter: int = 0
         self._step_delay_ms: int = 0
 
+        # Tracks whether _launch_browser used a real Chrome channel (affects UA override logic).
+        self._using_real_chrome_channel: bool = False
+
+    # ------------------------------------------------------------------
+    # Shared browser bootstrap helpers (browser-compatibility hardened)
+    # ------------------------------------------------------------------
+
+    _BROWSER_COMPAT_LAUNCH_ARGS = [
+        "--disable-blink-features=AutomationControlled",
+    ]
+
+    _BROWSER_COMPAT_INIT_SCRIPT = r"""
+    (() => {
+      // Mask navigator.webdriver
+      try { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); } catch (_) {}
+
+      // Realistic languages
+      try {
+        Object.defineProperty(navigator, 'languages', {
+          get: () => ['en-US', 'en'],
+        });
+      } catch (_) {}
+
+      // Chrome runtime presence (headless Chrome often lacks this)
+      try {
+        if (!window.chrome) { window.chrome = {}; }
+        if (!window.chrome.runtime) { window.chrome.runtime = {}; }
+        if (!window.chrome.app) { window.chrome.app = {}; }
+        if (!window.chrome.csi) { window.chrome.csi = () => ({ startE: Date.now() }); }
+      } catch (_) {}
+
+      // Permissions query normalization
+      try {
+        const originalQuery = window.navigator.permissions?.query;
+        if (originalQuery) {
+          window.navigator.permissions.query = (parameters) =>
+            parameters.name === 'notifications'
+              ? Promise.resolve({ state: Notification.permission })
+              : originalQuery(parameters);
+        }
+      } catch (_) {}
+
+      // Headless Chrome often reports empty plugins/mimeTypes.
+      try {
+        if (!navigator.plugins || navigator.plugins.length === 0) {
+          const fake = [
+            { name: 'Chrome PDF Plugin' },
+            { name: 'Chrome PDF Viewer' },
+            { name: 'Native Client' },
+          ];
+          Object.defineProperty(navigator, 'plugins', {
+            get: () => fake,
+          });
+        }
+      } catch (_) {}
+
+      try {
+        if (!navigator.mimeTypes || navigator.mimeTypes.length === 0) {
+          const fake = [{ type: 'application/pdf' }, { type: 'text/pdf' }];
+          Object.defineProperty(navigator, 'mimeTypes', {
+            get: () => fake,
+          });
+        }
+      } catch (_) {}
+
+      // Avoid obvious SwiftShader renderer fingerprints in headless.
+      try {
+        const _getParameter = WebGLRenderingContext.prototype.getParameter;
+        WebGLRenderingContext.prototype.getParameter = function (parameter) {
+          if (parameter === 37445) return 'Google Inc. (Intel)';
+          if (parameter === 37446) return 'ANGLE (Intel, Intel(R) UHD Graphics, OpenGL 4.1)';
+          return _getParameter.apply(this, [parameter]);
+        };
+      } catch (_) {}
+
+      // Best-effort cleanup of commonly checked CDP leak globals.
+      try {
+        for (const k of Object.keys(window)) {
+          if (k.startsWith('cdc_')) {
+            try { delete window[k]; } catch (_) {}
+          }
+        }
+      } catch (_) {}
+    })();
+    """
+
+    _CONSENT_DISMISS_SCRIPT = """
+    (() => {
+      const dismiss = () => {
+        try {
+          const accept = Array.from(document.querySelectorAll('button'))
+            .find(b => /accept\\s+all/i.test((b.textContent || '').trim()));
+          if (accept && /this\\s+site\\s+uses\\s+cookies/i.test(document.body?.innerText || '')) {
+            accept.click();
+          }
+        } catch (_) {}
+
+        try {
+          const host = document.getElementById('transcend-consent-manager');
+          const root = host && host.shadowRoot;
+          if (root) {
+            const accept = Array.from(root.querySelectorAll('button'))
+              .find(b => /accept\\s+all/i.test((b.textContent || '').trim()));
+            if (accept) accept.click();
+          }
+        } catch (_) {}
+
+        try {
+          const host = document.getElementById('transcend-consent-manager');
+          if (host) {
+            host.style.setProperty('display', 'none', 'important');
+            host.style.setProperty('pointer-events', 'none', 'important');
+          }
+        } catch (_) {}
+      };
+
+      try {
+        dismiss();
+        new MutationObserver(() => dismiss()).observe(document.documentElement, { childList: true, subtree: true });
+      } catch (_) {}
+    })();
+    """
+
+    def _launch_browser(self, p, *, headless: bool, slow_mo: int):
+        """
+        Launch Chromium with anti-detection defaults.
+
+        For headless runs, prefer Chromium's newer headless mode by passing
+        `--headless=new` and using `headless=False` at Playwright level.
+        """
+        args = list(self._BROWSER_COMPAT_LAUNCH_ARGS)
+        launch_headless = bool(headless)
+        if headless:
+            args.append("--headless=new")
+            launch_headless = False
+
+        launch_kwargs = dict(headless=launch_headless, slow_mo=slow_mo, args=args)
+
+        if headless:
+            for channel in ("chrome", "msedge", None):
+                try:
+                    kw = {**launch_kwargs}
+                    if channel is not None:
+                        kw["channel"] = channel
+                    browser = p.chromium.launch(**kw)
+                    self._using_real_chrome_channel = channel is not None
+                    return browser
+                except Exception:
+                    continue
+            raise RuntimeError("Could not launch any Chromium-based browser (tried chrome, msedge, bundled).")
+
+        try:
+            browser = p.chromium.launch(**launch_kwargs)
+            self._using_real_chrome_channel = False
+            return browser
+        except Exception as e:
+            msg = str(e)
+            if "Executable doesn't exist" not in msg and "Executable doesn't exist at" not in msg:
+                raise
+            logger.warning("Playwright Chromium executable missing; falling back to system browser channel. (%s)", msg)
+            for channel in ("chrome", "msedge"):
+                try:
+                    browser = p.chromium.launch(**{**launch_kwargs, "channel": channel})
+                    self._using_real_chrome_channel = True
+                    return browser
+                except Exception:
+                    continue
+            raise
+
+    def _create_browser_context(self, browser, *, storage_state: Optional[str] = None):
+        """
+        Create a browser context with realistic fingerprint settings.
+        """
+        ctx_kwargs: dict = {
+            "user_agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
+            ),
+            "color_scheme": "light",
+            "viewport": {"width": 1920, "height": 1080},
+            "locale": "en-US",
+            "extra_http_headers": {"Accept-Language": "en-US,en;q=0.9"},
+        }
+        if storage_state:
+            ctx_kwargs["storage_state"] = storage_state
+
+        return browser.new_context(**ctx_kwargs)
+
+    def _install_context_hooks(self, ctx) -> None:
+        """
+        Install route rewrites, browser compatibility patches, and consent-manager dismissal on a browser context.
+        """
+        # Rewrite the occasionally-seen "dark" host back to the canonical host.
+        try:
+            if self._dark_host and self._canonical_host:
+                def _rewrite(route, request) -> None:
+                    url = request.url
+                    fixed = url.replace(f"://{self._dark_host}", f"://{self._canonical_host}")
+                    route.continue_(url=fixed)
+
+                ctx.route(
+                    re.compile(rf".*://{re.escape(self._dark_host)}/.*", re.I),
+                    _rewrite,
+                )
+        except Exception:
+            logger.debug("Failed to install dark-host rewrite route.", exc_info=True)
+
+        ctx.add_init_script(self._BROWSER_COMPAT_INIT_SCRIPT)
+        ctx.add_init_script(self._CONSENT_DISMISS_SCRIPT)
+
+    def _human_delay(self, page: Page, min_ms: int = 80, max_ms: int = 250) -> None:
+        """Inject a small randomized delay to mimic human interaction timing."""
+        page.wait_for_timeout(random.randint(min_ms, max_ms))
+
     def extract(
         self,
         *,
@@ -91,90 +313,11 @@ class ServicerPortalClient:
         Path(debug_dir).mkdir(parents=True, exist_ok=True)
 
         def _install_context_hooks(ctx) -> None:
-            # Rewrite the occasionally-seen "dark" host back to the canonical host.
-            # We have observed headful sessions sometimes ending up on:
-            #   https://dark.<servicer>.studentaid.gov/...
-            # which frequently fails DNS resolution on some machines (NXDOMAIN).
-            try:
-                if not self._dark_host or not self._canonical_host:
-                    raise RuntimeError("canonical host missing")
-
-                def _rewrite(route, request) -> None:
-                    url = request.url
-                    fixed = url.replace(f"://{self._dark_host}", f"://{self._canonical_host}")
-                    route.continue_(url=fixed)
-
-                ctx.route(
-                    re.compile(rf".*://{re.escape(self._dark_host)}/.*", re.I),
-                    _rewrite,
-                )
-            except Exception:
-                logger.debug("Failed to install dark-host rewrite route.", exc_info=True)
-
-            # The portal uses a Transcend consent manager ("This site uses cookies") that can render
-            # inside a shadow root and intercept clicks (including the federal disclaimer).
-            # Install an init script so the consent UI is dismissed/hidden as soon as it mounts.
-            ctx.add_init_script(
-                """
-                (() => {
-                  const dismiss = () => {
-                    // If consent UI is in light DOM, try clicking "Accept all"
-                    try {
-                      const accept = Array.from(document.querySelectorAll('button'))
-                        .find(b => /accept\\s+all/i.test((b.textContent || '').trim()));
-                      if (accept && /this\\s+site\\s+uses\\s+cookies/i.test(document.body?.innerText || '')) {
-                        accept.click();
-                      }
-                    } catch (_) {}
-
-                    // If consent UI is in an OPEN shadow root, try clicking "Accept all"
-                    try {
-                      const host = document.getElementById('transcend-consent-manager');
-                      const root = host && host.shadowRoot;
-                      if (root) {
-                        const accept = Array.from(root.querySelectorAll('button'))
-                          .find(b => /accept\\s+all/i.test((b.textContent || '').trim()));
-                        if (accept) accept.click();
-                      }
-                    } catch (_) {}
-
-                    // Always hide the host so it cannot intercept clicks (works even if shadow root is CLOSED)
-                    try {
-                      const host = document.getElementById('transcend-consent-manager');
-                      if (host) {
-                        host.style.setProperty('display', 'none', 'important');
-                        host.style.setProperty('pointer-events', 'none', 'important');
-                      }
-                    } catch (_) {}
-                  };
-
-                  dismiss();
-                  new MutationObserver(() => dismiss()).observe(document.documentElement, { childList: true, subtree: true });
-                })();
-                """
-            )
+            # Keep local callsites unchanged while delegating to the shared implementation.
+            self._install_context_hooks(ctx)
 
         with sync_playwright() as p:
-            # Prefer Playwright's bundled Chromium, but fall back to a system-installed browser if the
-            # sandbox/cache doesn't have Playwright browsers available.
-            slow_mo = int(slow_mo_ms or 0)
-            try:
-                browser = p.chromium.launch(headless=headless, slow_mo=slow_mo)
-            except Exception as e:
-                msg = str(e)
-                if "Executable doesn't exist" not in msg and "Executable doesn't exist at" not in msg:
-                    raise
-
-                logger.warning(
-                    "Playwright Chromium executable missing; falling back to system browser channel. (%s)",
-                    msg,
-                )
-
-                # Try Chrome first, then Edge.
-                try:
-                    browser = p.chromium.launch(headless=headless, slow_mo=slow_mo, channel="chrome")
-                except Exception:
-                    browser = p.chromium.launch(headless=headless, slow_mo=slow_mo, channel="msedge")
+            browser = self._launch_browser(p, headless=headless, slow_mo=int(slow_mo_ms or 0))
             try:
                 # Attempt 1: reuse stored session (unless force_fresh_session).
                 # Attempt 2: fresh session (no stored cookies) — helpful when stored state causes
@@ -194,16 +337,11 @@ class ServicerPortalClient:
                     if use_storage and state_path is not None:
                         use_storage = self._validate_or_restore_storage_state(state_path)
 
-                    ctx_kwargs: dict = {}
-                    if use_storage:
-                        ctx_kwargs["storage_state"] = str(state_path)
-
-                    # Force light color scheme.
-                    ctx_kwargs["color_scheme"] = "light"
+                    storage = str(state_path) if use_storage else None
 
                     ctx = None
                     try:
-                        ctx = browser.new_context(**ctx_kwargs)
+                        ctx = self._create_browser_context(browser, storage_state=storage)
                     except Exception as e:
                         # If storage_state is invalid/corrupt, Playwright can fail before we ever get a Page.
                         if use_storage and state_path is not None:
@@ -212,9 +350,8 @@ class ServicerPortalClient:
                                 e,
                             )
                             self._quarantine_file(state_path, prefix="storage_state")
-                            ctx_kwargs.pop("storage_state", None)
                             use_storage = False
-                            ctx = browser.new_context(**ctx_kwargs)
+                            ctx = self._create_browser_context(browser, storage_state=None)
                         else:
                             raise
 
@@ -269,7 +406,8 @@ class ServicerPortalClient:
                                 and isinstance(e, LoginFormNotFoundError)
                                 and not self._looks_logged_in(page)
                             )
-                            if retry_for_browser_error or retry_for_login_form:
+                            retry_for_access_denied = isinstance(e, PortalAccessDeniedError)
+                            if retry_for_browser_error or retry_for_login_form or retry_for_access_denied:
                                 logger.warning(
                                     "Portal navigation/login failed%s; retrying once with a fresh session (no stored cookies).",
                                     " (stored session)" if use_storage else "",
@@ -312,65 +450,10 @@ class ServicerPortalClient:
         Path(debug_dir).mkdir(parents=True, exist_ok=True)
 
         def _install_context_hooks(ctx) -> None:
-            # Keep behavior consistent with `extract()`.
-            try:
-                if not self._dark_host or not self._canonical_host:
-                    raise RuntimeError("canonical host missing")
-
-                def _rewrite(route, request) -> None:
-                    url = request.url
-                    fixed = url.replace(f"://{self._dark_host}", f"://{self._canonical_host}")
-                    route.continue_(url=fixed)
-
-                ctx.route(
-                    re.compile(rf".*://{re.escape(self._dark_host)}/.*", re.I),
-                    _rewrite,
-                )
-            except Exception:
-                logger.debug("Failed to install dark-host rewrite route.", exc_info=True)
-
-            ctx.add_init_script(
-                """
-                (() => {
-                  const dismiss = () => {
-                    try {
-                      const accept = Array.from(document.querySelectorAll('button'))
-                        .find(b => /accept\\s+all/i.test((b.textContent || '').trim()));
-                      if (accept && /this\\s+site\\s+uses\\s+cookies/i.test(document.body?.innerText || '')) {
-                        accept.click();
-                      }
-                    } catch (_) {}
-
-                    try {
-                      const host = document.getElementById('transcend-consent-manager');
-                      const root = host && host.shadowRoot;
-                      if (root) {
-                        const accept = Array.from(root.querySelectorAll('button'))
-                          .find(b => /accept\\s+all/i.test((b.textContent || '').trim()));
-                        if (accept) accept.click();
-                      }
-                    } catch (_) {}
-
-                    try {
-                      const host = document.getElementById('transcend-consent-manager');
-                      if (host) {
-                        host.style.setProperty('display', 'none', 'important');
-                        host.style.setProperty('pointer-events', 'none', 'important');
-                      }
-                    } catch (_) {}
-                  };
-
-                  try {
-                    const observer = new MutationObserver(() => dismiss());
-                    observer.observe(document.documentElement, { childList: true, subtree: true });
-                    dismiss();
-                  } catch (_) {}
-                })();
-                """
-            )
+            self._install_context_hooks(ctx)
 
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=headless, slow_mo=slow_mo_ms)
+            browser = self._launch_browser(p, headless=headless, slow_mo=int(slow_mo_ms or 0))
             try:
                 for attempt_idx in range(2):
                     use_storage = (
@@ -379,14 +462,11 @@ class ServicerPortalClient:
                     if use_storage and state_path is not None:
                         use_storage = self._validate_or_restore_storage_state(state_path)
 
-                    ctx_kwargs: dict = {}
-                    if use_storage:
-                        ctx_kwargs["storage_state"] = str(state_path)
-                    ctx_kwargs["color_scheme"] = "light"
+                    storage = str(state_path) if use_storage else None
 
                     ctx = None
                     try:
-                        ctx = browser.new_context(**ctx_kwargs)
+                        ctx = self._create_browser_context(browser, storage_state=storage)
                     except Exception as e:
                         if use_storage and state_path is not None:
                             logger.warning(
@@ -394,9 +474,8 @@ class ServicerPortalClient:
                                 e,
                             )
                             self._quarantine_file(state_path, prefix="storage_state")
-                            ctx_kwargs.pop("storage_state", None)
                             use_storage = False
-                            ctx = browser.new_context(**ctx_kwargs)
+                            ctx = self._create_browser_context(browser, storage_state=None)
                         else:
                             raise
 
@@ -456,7 +535,8 @@ class ServicerPortalClient:
                             retry_for_login_form = (
                                 use_storage and isinstance(e, LoginFormNotFoundError) and not self._looks_logged_in(page)
                             )
-                            if retry_for_browser_error or retry_for_login_form:
+                            retry_for_access_denied = isinstance(e, PortalAccessDeniedError)
+                            if retry_for_browser_error or retry_for_login_form or retry_for_access_denied:
                                 logger.warning(
                                     "Portal navigation/login failed%s; retrying once with a fresh session (no stored cookies).",
                                     " (stored session)" if use_storage else "",
@@ -535,58 +615,20 @@ class ServicerPortalClient:
                 pass
 
         def _install_context_hooks(ctx) -> None:
-            # Same stability hooks as extract()/discover.
-            try:
-                if self._dark_host and self._canonical_host:
-                    def _rewrite(route, request) -> None:
-                        url = request.url
-                        fixed = url.replace(f"://{self._dark_host}", f"://{self._canonical_host}")
-                        route.continue_(url=fixed)
-
-                    ctx.route(re.compile(rf".*://{re.escape(self._dark_host)}/.*", re.I), _rewrite)
-            except Exception:
-                logger.debug("Failed to install dark-host rewrite route.", exc_info=True)
-
-            ctx.add_init_script(
-                """
-                (() => {
-                  const dismiss = () => {
-                    try {
-                      const accept = Array.from(document.querySelectorAll('button'))
-                        .find(b => /accept\\s+all/i.test((b.textContent || '').trim()));
-                      if (accept && /this\\s+site\\s+uses\\s+cookies/i.test(document.body?.innerText || '')) {
-                        accept.click();
-                      }
-                    } catch (_) {}
-                    try {
-                      const host = document.getElementById('transcend-consent-manager');
-                      if (host) {
-                        host.style.setProperty('display', 'none', 'important');
-                        host.style.setProperty('pointer-events', 'none', 'important');
-                      }
-                    } catch (_) {}
-                  };
-                  try {
-                    const observer = new MutationObserver(() => dismiss());
-                    observer.observe(document.documentElement, { childList: true, subtree: true });
-                    dismiss();
-                  } catch (_) {}
-                })();
-                """
-            )
+            self._install_context_hooks(ctx)
 
         bundle_path: Optional[Path] = None
         err: Optional[BaseException] = None
         try:
             with sync_playwright() as p:
-                browser = p.chromium.launch(headless=headless, slow_mo=int(slow_mo_ms or 0))
+                browser = self._launch_browser(p, headless=headless, slow_mo=int(slow_mo_ms or 0))
                 try:
-                    ctx_kwargs: dict = {"color_scheme": "light"}
+                    storage = None
                     if state_path and state_path.exists() and not force_fresh_session:
                         if self._validate_or_restore_storage_state(state_path):
-                            ctx_kwargs["storage_state"] = str(state_path)
+                            storage = str(state_path)
 
-                    ctx = browser.new_context(**ctx_kwargs)
+                    ctx = self._create_browser_context(browser, storage_state=storage)
                     try:
                         _install_context_hooks(ctx)
 
@@ -742,8 +784,33 @@ class ServicerPortalClient:
         manual_mfa: bool = False,
     ) -> None:
         try:
+            # Catch mid-session 403s as well (not just on the initial goto).
+            # Some servicer portals return a bare 403 page with minimal body content.
+            saw_403_document = {"value": False}
+            def _on_response(resp) -> None:
+                try:
+                    if resp.status == 403:
+                        # Only treat 403 as fatal when it is for the main document navigation.
+                        # Some portals may return 403 for subresources; failing fast on those
+                        # can create false positives.
+                        try:
+                            req = resp.request
+                            if req.resource_type == "document" and req.frame == page.main_frame:
+                                saw_403_document["value"] = True
+                        except Exception:
+                            pass
+                        self._save_debug(page, debug_dir=debug_dir, name_prefix="access_denied_403_response")
+                except Exception:
+                    pass
+
+            page.on("response", _on_response)
+
             page.goto(self.base_url, wait_until="domcontentloaded")
             self._wait_for_settle(page)
+            if saw_403_document["value"]:
+                # Prefer failing fast into the retry loop rather than continuing to parse a blocked session.
+                self._raise_if_access_denied(page, debug_dir=debug_dir)
+            self._raise_if_access_denied(page, debug_dir=debug_dir)
             self._step(page, debug_dir=debug_dir, name="after_goto")
             self._dismiss_cookie_banner(page)
             self._step(page, debug_dir=debug_dir, name="after_cookie_dismiss")
@@ -1493,6 +1560,36 @@ class ServicerPortalClient:
             pass
 
         return False
+
+    def _looks_like_access_denied(self, page: Page) -> bool:
+        """
+        Detect HTTP 403 / Access Denied responses that some servicer portals return
+        when anti-automation detection fires (especially in headless mode).
+        """
+        try:
+            body = (page.inner_text("body") or "").strip()
+            if not body or len(body) > 500:
+                return False
+            low = body.lower()
+            if "403" in low and "access denied" in low:
+                return True
+            if "access denied" in low and len(body) < 100:
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _raise_if_access_denied(self, page: Page, *, debug_dir: str) -> None:
+        if self._looks_like_access_denied(page):
+            self._save_debug(page, debug_dir=debug_dir, name_prefix="access_denied_403")
+            raise PortalAccessDeniedError(
+                "The servicer portal returned HTTP 403 (Access Denied). This is typically caused by "
+                "anti-automation detection in headless mode. Remediation steps:\n"
+                "  1. Try running with --headful --manual-mfa to establish a trusted session first.\n"
+                "  2. If the issue persists, try --fresh-session to clear stale cookies.\n"
+                "  3. Ensure you are not running from a datacenter IP with poor reputation.\n"
+                "See https://github.com/mattebad/monarch-studentaid-sync/issues/9 for discussion."
+            )
 
     def _extract_loans(
         self,

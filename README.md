@@ -240,11 +240,13 @@ Tip: run the exact command once in PowerShell first to confirm it works before s
 
 ### How it works (high level)
 - Logs into your servicer portal (typically `https://{provider}.studentaid.gov`) with Playwright
+- Browser sessions use **browser-compatibility defaults** (automation flags disabled, realistic viewport/locale/user-agent, randomized interaction delays) to reduce anti-automation detection
 - When the portal prompts for MFA, selects **Email**, then polls Gmail IMAP for the code
 - Scrapes per-loan balances + payment allocation details
+  - **Non-posted payments** (pending, scheduled, processing, cancelled) are automatically detected and skipped — only fully posted payments are synced
 - Pushes updates into Monarch via the unofficial Monarch API client
 - Stores a small SQLite state DB so runs are **idempotent** (no duplicate payment transactions)
-- Includes an extra **duplicate guard** against Monarch itself: **date + amount + merchant** (so even if you reset SQLite, we won't spam duplicates).
+- Includes an extra **duplicate guard** against Monarch itself: **date + amount + merchant** (so even if you reset SQLite, we won’t spam duplicates).
   - Optional: you can enable a more specific duplicate check that also uses the portal’s **payment confirmation/reference** as a search term (see [Config notes (Monarch payments)](#config-notes-monarch-payments)).
 
 <a id="gmail-imap-setup"></a>
@@ -301,6 +303,8 @@ If a `sync` run fails, the CLI will automatically create a zip under `data/` con
 - `data/debug/*` (screenshots/HTML/text snapshots)
 - your configured log file (default: `data/sync.log`)
 
+The log file now includes the **full exception traceback** for run failures, so you can see the exact line and error without needing to reproduce the issue interactively.
+
 You can attach that zip when asking for help.
 
 #### Parsing debug text snapshots (offline)
@@ -317,6 +321,8 @@ See **Quick start → Runtime A: Docker (recommended)** for the Unraid schedulin
 ### Notes / stability
 - StudentAid servicer portals are web portals; UI changes may break selectors. The code is structured so selectors live in one place, and failures should save screenshots/logs for debugging.
 - Email MFA automation is sensitive—use a dedicated mailbox if possible.
+- **Non-posted payment handling**: payments with status _pending_, _scheduled_, _processing_, or _cancelled_ are automatically skipped. Only fully posted (electronic/regular) payments produce Monarch transactions. If a single row fails to parse, it is skipped with a warning rather than aborting the whole run.
+- **Anti-automation / 403 detection**: if the portal returns an HTTP 403 Access Denied (common in headless runs on some servicers), the tool detects it immediately, saves a debug snapshot, and retries once with a fresh session. If it persists, see the [403 troubleshooting entry](#403-access-denied) below.
 - State self-heal:
   - `data/state.db` (SQLite idempotency DB) is backed up to `data/state.db.bak`. If `state.db` is corrupted/unreadable, the script will restore from the backup (or recreate it if no backup exists).
   - `data/servicer_storage_state_*.json` (Playwright cookies/localStorage) is backed up to `*.bak`. If it becomes invalid JSON, the script quarantines it and falls back to a fresh session.
@@ -330,6 +336,16 @@ See **Quick start → Runtime A: Docker (recommended)** for the Unraid schedulin
   - Confirm Gmail IMAP is enabled and `GMAIL_IMAP_FOLDER` matches the label name.
   - Set broad hints: `GMAIL_IMAP_SENDER_HINT=studentaid.gov` and `GMAIL_IMAP_SUBJECT_HINT=code`.
   - Make sure the filter applies the label and the email isn’t in Spam.
+
+<a id="403-access-denied"></a>
+- **HTTP 403 Access Denied / portal blocks the headless browser**
+  - Some servicers (notably Nelnet) occasionally return a bare `HTTP 403 Access Denied` page to headless browsers that look like automation. The tool detects this and retries once with a fresh session automatically.
+  - If it keeps failing, try the following in order:
+    1. Run `sync --headful --manual-mfa` once to establish a fresh, trusted browser session stored under `data/servicer_storage_state_*.json`. Subsequent headless runs reuse that session.
+    2. Add `--fresh-session` to force discarding any stale stored session before retrying.
+    3. If running in Docker on a cloud/datacenter host, try from a residential IP address — some portal WAFs block datacenter IP ranges.
+  - A `data/debug/access_denied_403_*.png` screenshot is saved automatically so you can confirm what the portal returned.
+  - See also [GitHub issue #9](https://github.com/mattebad/monarch-studentaid-sync/issues/9) for community discussion.
 
 ### Config notes (Monarch payments)
 - `monarch.payment_merchant_name`: merchant name to use when creating payment transactions, and the value used by the **duplicate guard**.
