@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import json
+import os
 import random
 import re
 import shutil
@@ -79,7 +80,19 @@ class ServicerPortalClient:
         "--disable-blink-features=AutomationControlled",
     ]
 
-    _BROWSER_COMPAT_INIT_SCRIPT = r"""
+    _WINDOWS_CHROME_USER_AGENT = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
+    )
+
+    _LINUX_CHROME_USER_AGENT = (
+        "Mozilla/5.0 (X11; Linux x86_64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
+    )
+
+    _BROWSER_COMPAT_INIT_SCRIPT_TEMPLATE = r"""
     (() => {
       // Mask navigator.webdriver
       try { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); } catch (_) {}
@@ -88,6 +101,13 @@ class ServicerPortalClient:
       try {
         Object.defineProperty(navigator, 'languages', {
           get: () => ['en-US', 'en'],
+        });
+      } catch (_) {}
+
+      // Keep platform aligned with the chosen runtime/user-agent.
+      try {
+        Object.defineProperty(navigator, 'platform', {
+          get: () => __NAVIGATOR_PLATFORM__,
         });
       } catch (_) {}
 
@@ -191,6 +211,28 @@ class ServicerPortalClient:
     })();
     """
 
+    def _browser_compat_runtime(self) -> str:
+        runtime = (os.getenv("STUDENTAID_MONARCH_RUNTIME") or "").strip().lower()
+        if runtime in {"docker", "native"}:
+            return runtime
+        return "docker" if Path("/.dockerenv").exists() else "native"
+
+    def _browser_compat_user_agent(self) -> str:
+        if self._browser_compat_runtime() == "docker":
+            return self._LINUX_CHROME_USER_AGENT
+        return self._WINDOWS_CHROME_USER_AGENT
+
+    def _browser_compat_platform(self) -> str:
+        if self._browser_compat_runtime() == "docker":
+            return "Linux x86_64"
+        return "Win32"
+
+    def _browser_compat_init_script(self) -> str:
+        return self._BROWSER_COMPAT_INIT_SCRIPT_TEMPLATE.replace(
+            "__NAVIGATOR_PLATFORM__",
+            json.dumps(self._browser_compat_platform()),
+        )
+
     def _launch_browser(self, p, *, headless: bool, slow_mo: int):
         """
         Launch Chromium with anti-detection defaults.
@@ -242,11 +284,7 @@ class ServicerPortalClient:
         Create a browser context with realistic fingerprint settings.
         """
         ctx_kwargs: dict = {
-            "user_agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Safari/537.36"
-            ),
+            "user_agent": self._browser_compat_user_agent(),
             "color_scheme": "light",
             "viewport": {"width": 1920, "height": 1080},
             "locale": "en-US",
@@ -276,7 +314,7 @@ class ServicerPortalClient:
         except Exception:
             logger.debug("Failed to install dark-host rewrite route.", exc_info=True)
 
-        ctx.add_init_script(self._BROWSER_COMPAT_INIT_SCRIPT)
+        ctx.add_init_script(self._browser_compat_init_script())
         ctx.add_init_script(self._CONSENT_DISMISS_SCRIPT)
 
     def _human_delay(self, page: Page, min_ms: int = 80, max_ms: int = 250) -> None:

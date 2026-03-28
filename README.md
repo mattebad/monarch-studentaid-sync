@@ -85,6 +85,7 @@ Pick **one** of the following and run it end-to-end. For most people (especially
 
 #### Runtime A: Docker (recommended) 🐳
 This repo includes a `docker-compose.yml` service that runs the sync as a **run-once** container.
+The Docker image now installs a real **Google Chrome** channel and uses a Linux-specific browser-compat profile, which reduces `HeadlessChrome`-style fingerprinting that can trigger portal `403 Access Denied` responses.
 
 ##### Docker Desktop (Windows/macOS)
 1. Install Docker Desktop and make sure `docker compose` works in a terminal.
@@ -122,7 +123,7 @@ To keep the scheduled command simple (and easy to update later), you can schedul
   - **Add arguments** (example):
 
 ```text
--NoProfile -File .\scripts\docker_sync.ps1 run --payments-since 2025-01-01
+-NoProfile -File .\scripts\docker_sync.ps1 update-run --payments-since 2025-01-01
 ```
 
   - **Start in**: `C:\path\to\repo` (the folder that contains `docker-compose.yml`)
@@ -131,14 +132,14 @@ To keep the scheduled command simple (and easy to update later), you can schedul
   - Create a LaunchAgent that runs:
 
 ```bash
-cd /path/to/repo && bash ./scripts/docker_sync.sh run --payments-since 2025-01-01
+cd /path/to/repo && bash ./scripts/docker_sync.sh update-run --payments-since 2025-01-01
 ```
 
 - **Linux (cron/systemd)**:
   - Use cron or a systemd timer to run the same command on your desired timeframe:
 
 ```bash
-cd /path/to/repo && bash ./scripts/docker_sync.sh run --payments-since 2025-01-01
+cd /path/to/repo && bash ./scripts/docker_sync.sh update-run --payments-since 2025-01-01
 ```
 
 ##### Unraid (NAS)
@@ -160,7 +161,7 @@ bash ./scripts/docker_sync.sh dry-run --payments-since 2025-01-01
 4. Schedule it (e.g., Unraid **User Scripts** plugin) with a daily command like:
 
 ```bash
-cd /path/to/repo && bash ./scripts/docker_sync.sh run --payments-since 2025-01-01
+cd /path/to/repo && bash ./scripts/docker_sync.sh update-run --payments-since 2025-01-01
 ```
 
 Keep `./data` persistent so sessions and the SQLite idempotency DB survive restarts.
@@ -340,6 +341,7 @@ See **Quick start → Runtime A: Docker (recommended)** for the Unraid schedulin
 <a id="403-access-denied"></a>
 - **HTTP 403 Access Denied / portal blocks the headless browser**
   - Some servicers (notably Nelnet) occasionally return a bare `HTTP 403 Access Denied` page to headless browsers that look like automation. The tool detects this and retries once with a fresh session automatically.
+  - Docker builds now install a real Chrome channel and use a Linux-aligned browser fingerprint. If you updated from an older image, rebuild it first with `docker compose build --no-cache`.
   - If it keeps failing, try the following in order:
     1. Run `sync --headful --manual-mfa` once to establish a fresh, trusted browser session stored under `data/servicer_storage_state_*.json`. Subsequent headless runs reuse that session.
     2. Add `--fresh-session` to force discarding any stale stored session before retrying.
