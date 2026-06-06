@@ -7,6 +7,7 @@ set -euo pipefail
 #   ./scripts/docker_sync.sh setup-accounts
 #   ./scripts/docker_sync.sh preflight
 #   ./scripts/docker_sync.sh dry-run --payments-since 2025-01-01
+#   ./scripts/docker_sync.sh dry-run --dry-run-check-monarch --payments-since 2025-01-01
 #   ./scripts/docker_sync.sh run --payments-since 2025-01-01
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

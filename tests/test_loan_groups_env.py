@@ -12,7 +12,7 @@ def test_loan_groups_can_come_from_env(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("SERVICER_PASSWORD", "p")
     monkeypatch.setenv("GMAIL_IMAP_USER", "me@gmail.com")
     monkeypatch.setenv("GMAIL_IMAP_APP_PASSWORD", "app-pass")
-    monkeypatch.setenv("MONARCH_TOKEN", "dummy")
+    monkeypatch.setenv("MONARCH_COOKIE_STRING", "session_id=dummy; csrftoken=dummy")
     monkeypatch.setenv("LOAN_GROUPS", "AA, 1-01")
 
     cfg = load_config(cfg_path)
@@ -27,7 +27,7 @@ def test_invalid_loan_groups_warn_and_are_ignored(tmp_path, monkeypatch, caplog)
     monkeypatch.setenv("SERVICER_PASSWORD", "p")
     monkeypatch.setenv("GMAIL_IMAP_USER", "me@gmail.com")
     monkeypatch.setenv("GMAIL_IMAP_APP_PASSWORD", "app-pass")
-    monkeypatch.setenv("MONARCH_TOKEN", "dummy")
+    monkeypatch.setenv("MONARCH_COOKIE_STRING", "session_id=dummy; csrftoken=dummy")
     monkeypatch.setenv(
         "LOAN_GROUPS",
         "AA, ??, 1-01, 1_02, AB, , 123456789012345678901234567890123, A",
