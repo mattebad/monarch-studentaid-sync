@@ -45,6 +45,23 @@ class PortalSelectors:
     mfa_code_input: str = 'input[type="tel"], input[inputmode="numeric"], input[name*="code" i]'
     mfa_verify_text: str = "Verify"
 
+    # New-device identity challenge ("We don't recognize the device you're using").
+    # EdFinancial shows this instead of an email code on an unrecognized device.
+    # Section 1: SSN (3 fields) OR Account Number. Section 2: Date of Birth (MM/DD/YYYY).
+    device_verify_detect: str = (
+        '#account-number, #lblSSN1, input[name="taccountNumber"], input[name="tSSN1"], input[name="tmonth"]'
+    )
+    device_verify_account_input: str = '#account-number, input[name="taccountNumber"]'
+    device_verify_ssn_inputs: tuple = (
+        'input[name="tSSN1"]',
+        'input[name="tSSN2"]',
+        'input[name="tSSN3"]',
+    )
+    device_verify_dob_month: str = '#dob1, input[name="tmonth"]'
+    device_verify_dob_day: str = '#dob2, input[name="tday"]'
+    device_verify_dob_year: str = 'input[name="tyear"]'
+    device_verify_submit: str = '#Submit, button[name="Submit"], button.submit'
+
     # Navigation
     nav_my_loans_text: tuple[str, ...] = ("My Loans", "My Loan", "Loans")
     nav_payment_activity_text: tuple[str, ...] = ("Payment Activity", "Payment History", "Payments")

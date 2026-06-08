@@ -128,6 +128,10 @@ def _default_config_from_env() -> dict:
             "username": os.getenv("SERVICER_USERNAME", ""),
             "password": os.getenv("SERVICER_PASSWORD", ""),
             "mfa_method": os.getenv("SERVICER_MFA_METHOD", "email"),
+            # New-device identity challenge (account number/SSN + DOB) for servicers like EdFinancial.
+            "account_number": os.getenv("SERVICER_ACCOUNT_NUMBER", ""),
+            "date_of_birth": os.getenv("SERVICER_DOB", ""),
+            "ssn": os.getenv("SERVICER_SSN", ""),
         },
         "gmail_imap": {
             "user": os.getenv("GMAIL_IMAP_USER", ""),
@@ -174,6 +178,11 @@ class ServicerConfig(BaseModel):
     username: str
     password: str
     mfa_method: Literal["email"] = "email"
+    # New-device identity challenge (account number/SSN + DOB) for servicers like EdFinancial.
+    # repr-hidden so secrets do not leak into logs.
+    account_number: str = Field(default="", repr=False)
+    date_of_birth: str = Field(default="", repr=False)
+    ssn: str = Field(default="", repr=False)
 
     @model_validator(mode="after")
     def _fill_defaults_and_validate(self) -> "ServicerConfig":

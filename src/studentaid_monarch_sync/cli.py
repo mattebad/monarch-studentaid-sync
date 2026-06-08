@@ -310,7 +310,13 @@ def main(argv: Optional[List[str]] = None) -> int:
 
                 portal = ServicerPortalClient(
                     base_url=cfg.servicer.base_url,
-                    creds=PortalCredentials(username=cfg.servicer.username, password=cfg.servicer.password),
+                    creds=PortalCredentials(
+                username=cfg.servicer.username,
+                password=cfg.servicer.password,
+                account_number=cfg.servicer.account_number,
+                date_of_birth=cfg.servicer.date_of_birth,
+                ssn=cfg.servicer.ssn,
+            ),
                 )
 
                 mfa_provider = lambda: poll_gmail_imap_for_code(cfg.gmail_imap, print_code=args.print_mfa_code)
@@ -427,7 +433,13 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         portal = ServicerPortalClient(
             base_url=cfg.servicer.base_url,
-            creds=PortalCredentials(username=cfg.servicer.username, password=cfg.servicer.password),
+            creds=PortalCredentials(
+                username=cfg.servicer.username,
+                password=cfg.servicer.password,
+                account_number=cfg.servicer.account_number,
+                date_of_birth=cfg.servicer.date_of_birth,
+                ssn=cfg.servicer.ssn,
+            ),
         )
         mfa_provider = lambda: poll_gmail_imap_for_code(cfg.gmail_imap, print_code=args.print_mfa_code)
 
@@ -490,7 +502,13 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         portal = ServicerPortalClient(
             base_url=cfg.servicer.base_url,
-            creds=PortalCredentials(username=cfg.servicer.username, password=cfg.servicer.password),
+            creds=PortalCredentials(
+                username=cfg.servicer.username,
+                password=cfg.servicer.password,
+                account_number=cfg.servicer.account_number,
+                date_of_birth=cfg.servicer.date_of_birth,
+                ssn=cfg.servicer.ssn,
+            ),
         )
 
         mfa_provider = lambda: poll_gmail_imap_for_code(cfg.gmail_imap, print_code=args.print_mfa_code)
