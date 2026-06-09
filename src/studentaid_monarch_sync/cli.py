@@ -37,6 +37,17 @@ from .util.money import cents_to_money_str
 logger = logging.getLogger("studentaid_monarch_sync")
 
 
+def _build_monarch_client(cfg) -> MonarchClient:
+    return MonarchClient(
+        email=cfg.monarch.email,
+        password=cfg.monarch.password,
+        cookie_string=cfg.monarch.cookie_string,
+        token=cfg.monarch.token,
+        mfa_secret=cfg.monarch.mfa_secret,
+        session_file=cfg.monarch.session_file,
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="studentaid_monarch_sync")
     p.add_argument(
@@ -150,6 +161,21 @@ def _build_parser() -> argparse.ArgumentParser:
         "--out",
         default="",
         help="Optional output path for the mapping JSON (default: data/monarch_loan_accounts_{provider}.json)",
+    )
+
+    bootstrap = sub.add_parser(
+        "bootstrap-monarch-auth",
+        help="Open Monarch in a browser, let you log in once, and save a reusable Monarch session.",
+    )
+    bootstrap.add_argument(
+        "--url",
+        default="https://app.monarchmoney.com",
+        help="Monarch login/start URL to open (default: https://app.monarchmoney.com)",
+    )
+    bootstrap.add_argument(
+        "--out",
+        default="",
+        help="Path to save the Monarch session pickle (default: MONARCH_SESSION_FILE or data/monarch_session.pickle)",
     )
 
     list_servicers = sub.add_parser(
@@ -413,6 +439,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
         return 0
 
+    if args.cmd == "bootstrap-monarch-auth":
+        configure_logging(level=os.getenv("LOG_LEVEL", "INFO"))
+        out_path = args.out or os.getenv("MONARCH_SESSION_FILE", "data/monarch_session.pickle")
+        asyncio.run(_bootstrap_monarch_auth(login_url=args.url, out_path=out_path))
+        return 0
+
     if args.cmd == "list-loan-groups":
         cfg = load_config(args.config)
         configure_logging(level=cfg.logging.level, file_path=cfg.logging.file_path)
@@ -523,27 +555,30 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 def _require_monarch_auth(cfg) -> None:
     m = cfg.monarch
+    if getattr(m, "cookie_string", ""):
+        return
     if getattr(m, "token", ""):
         return
     if getattr(m, "email", "") and getattr(m, "password", ""):
         return
-    raise SystemExit("Missing Monarch auth. Set MONARCH_TOKEN or MONARCH_EMAIL + MONARCH_PASSWORD in your .env.")
+    session_file = Path(getattr(m, "session_file", "") or "")
+    if session_file.exists():
+        return
+    raise SystemExit(
+        "Missing Monarch auth. Use bootstrap-monarch-auth once, set MONARCH_COOKIE_STRING or split cookie vars "
+        "(MONARCH_COOKIE_SESSION_ID + MONARCH_COOKIE_CSRFTOKEN), or use MONARCH_EMAIL + MONARCH_PASSWORD. "
+        "An existing data/monarch_session.pickle also works."
+    )
 
 
 async def _preflight_monarch(cfg, *, check_mappings: bool = True) -> None:
     """
     Validate Monarch auth and basic config mapping without mutating anything.
 
-    This is deliberately lightweight: it catches invalid/expired tokens and bad account/category mappings
+    This is deliberately lightweight: it catches invalid/expired Monarch cookies/sessions and bad account/category mappings
     before we spend time logging into the StudentAid portal.
     """
-    mc = MonarchClient(
-        email=cfg.monarch.email,
-        password=cfg.monarch.password,
-        token=cfg.monarch.token,
-        mfa_secret=cfg.monarch.mfa_secret,
-        session_file=cfg.monarch.session_file,
-    )
+    mc = _build_monarch_client(cfg)
 
     try:
         await mc.login()
@@ -563,9 +598,10 @@ async def _preflight_monarch(cfg, *, check_mappings: bool = True) -> None:
         logger.info("Monarch preflight OK (accounts=%d, transfer_category=%r)", len(accounts), cfg.monarch.transfer_category_name)
     except Exception as e:
         raise RuntimeError(
-            "Monarch preflight failed. This often means your MONARCH_TOKEN/session is invalid/expired, "
-            "or your loan account mappings are missing/wrong. Fix Monarch auth (or delete data/monarch_session.pickle), "
-            "then run `studentaid_monarch_sync setup-monarch-accounts --apply` to auto-create/map accounts."
+            "Monarch preflight failed. This often means your MONARCH_COOKIE_STRING is invalid/expired, "
+            "or split cookie vars are wrong, or data/monarch_session.pickle is stale, or your loan account mappings are missing/wrong. "
+            "Delete the session pickle, rerun bootstrap-monarch-auth or refresh cookie vars, then rerun `studentaid_monarch_sync preflight` "
+            "and `studentaid_monarch_sync setup-monarch-accounts --apply` if mappings still need setup."
         ) from e
 
 
@@ -598,6 +634,68 @@ def _preflight_gmail_imap(cfg) -> None:
         raise RuntimeError(
             "Gmail IMAP preflight failed. Check GMAIL_IMAP_USER/GMAIL_IMAP_APP_PASSWORD and folder/label configuration."
         ) from e
+
+
+def _build_monarch_cookie_string(*, session_id: str, csrftoken: str) -> str:
+    sid = (session_id or "").strip()
+    csrf = (csrftoken or "").strip()
+    if not sid or not csrf:
+        raise ValueError("Both session_id and csrftoken are required.")
+    return f"session_id={sid}; csrftoken={csrf}"
+
+
+async def _bootstrap_monarch_auth(*, login_url: str, out_path: str) -> None:
+    """
+    Open Monarch in a browser, let the user complete a login, and save a reusable Monarch session.
+
+    This avoids manual copy/paste of cookie values for first-time setup.
+    """
+    from monarchmoney import MonarchMoney
+    from playwright.async_api import async_playwright
+
+    logger.info("Opening Monarch browser at %s", login_url)
+    logger.info("Log in manually, then come back here and press Enter to capture cookies.")
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=False)
+        context = await browser.new_context()
+        page = await context.new_page()
+        try:
+            await page.goto(login_url, wait_until="domcontentloaded")
+            input("Press Enter after Monarch login is complete...")
+
+            cookies = await context.cookies()
+            cookie_map = {
+                str(c.get("name") or ""): str(c.get("value") or "")
+                for c in cookies
+                if str(c.get("name") or "") in {"session_id", "csrftoken"}
+            }
+
+            if "session_id" not in cookie_map or "csrftoken" not in cookie_map:
+                found = ", ".join(sorted({str(c.get("name") or "") for c in cookies if c.get("name")}))
+                raise RuntimeError(
+                    "Could not find session_id + csrftoken after login. "
+                    f"Cookies seen: {found or '(none)'}"
+                )
+
+            cookie_string = _build_monarch_cookie_string(
+                session_id=cookie_map["session_id"],
+                csrftoken=cookie_map["csrftoken"],
+            )
+
+            mm = MonarchMoney(session_file=out_path)
+            await mm.login_with_cookies(cookie_string, save_session=True, verify=True)
+            logger.info("Bootstrap complete. Saved Monarch session to %s", out_path)
+            print(f"✅ Saved Monarch session: {out_path}")
+        finally:
+            try:
+                await context.close()
+            except Exception:
+                pass
+            try:
+                await browser.close()
+            except Exception:
+                pass
 
 
 def _log_dry_run(cfg, state: StateStore, loan_snapshots, payment_allocations) -> None:
@@ -639,13 +737,7 @@ async def _log_dry_run_with_monarch(cfg, state: StateStore, loan_snapshots, paym
     """
     from datetime import date as _date
 
-    mc = MonarchClient(
-        email=cfg.monarch.email,
-        password=cfg.monarch.password,
-        token=cfg.monarch.token,
-        mfa_secret=cfg.monarch.mfa_secret,
-        session_file=cfg.monarch.session_file,
-    )
+    mc = _build_monarch_client(cfg)
     await mc.login()
 
     transfer_category_id = await mc.get_category_id_by_name(cfg.monarch.transfer_category_name)
@@ -762,13 +854,7 @@ async def _log_dry_run_with_monarch(cfg, state: StateStore, loan_snapshots, paym
 
 
 async def _list_monarch_accounts(cfg) -> None:
-    mc = MonarchClient(
-        email=cfg.monarch.email,
-        password=cfg.monarch.password,
-        token=cfg.monarch.token,
-        mfa_secret=cfg.monarch.mfa_secret,
-        session_file=cfg.monarch.session_file,
-    )
+    mc = _build_monarch_client(cfg)
     await mc.login()
     accounts = await mc.list_accounts()
 
@@ -997,13 +1083,7 @@ async def _setup_monarch_accounts(
     if not template:
         template = DEFAULT_LOAN_ACCOUNT_NAME_TEMPLATE
 
-    mc = MonarchClient(
-        email=cfg.monarch.email,
-        password=cfg.monarch.password,
-        token=cfg.monarch.token,
-        mfa_secret=cfg.monarch.mfa_secret,
-        session_file=cfg.monarch.session_file,
-    )
+    mc = _build_monarch_client(cfg)
     await mc.login()
 
     if not apply:
@@ -1068,13 +1148,7 @@ async def _apply_monarch_updates(
 ) -> None:
     from datetime import date as _date
 
-    mc = MonarchClient(
-        email=cfg.monarch.email,
-        password=cfg.monarch.password,
-        token=cfg.monarch.token,
-        mfa_secret=cfg.monarch.mfa_secret,
-        session_file=cfg.monarch.session_file,
-    )
+    mc = _build_monarch_client(cfg)
     await mc.login()
 
     transfer_category_id = await mc.get_category_id_by_name(cfg.monarch.transfer_category_name)

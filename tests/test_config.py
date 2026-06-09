@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from studentaid_monarch_sync.cli import _build_monarch_cookie_string
 from studentaid_monarch_sync.config import _derive_provider_from_base_url, load_config
 
 
@@ -104,5 +105,38 @@ monarch:
     )
     with pytest.raises(Exception):
         _ = load_config(cfg_path)
+
+
+def test_monarch_cookie_string_comes_from_env(tmp_path: Path, monkeypatch) -> None:
+    cfg_path = tmp_path / "missing.yaml"
+
+    monkeypatch.setenv("SERVICER_PROVIDER", "nelnet")
+    monkeypatch.setenv("SERVICER_USERNAME", "u")
+    monkeypatch.setenv("SERVICER_PASSWORD", "p")
+    monkeypatch.setenv("GMAIL_IMAP_USER", "me@gmail.com")
+    monkeypatch.setenv("GMAIL_IMAP_APP_PASSWORD", "app-pass")
+    monkeypatch.setenv("MONARCH_COOKIE_STRING", "session_id=abc; csrftoken=def")
+
+    cfg = load_config(cfg_path)
+    assert cfg.monarch.cookie_string == "session_id=abc; csrftoken=def"
+
+
+def test_monarch_cookie_string_comes_from_split_env_vars(tmp_path: Path, monkeypatch) -> None:
+    cfg_path = tmp_path / "missing.yaml"
+
+    monkeypatch.setenv("SERVICER_PROVIDER", "nelnet")
+    monkeypatch.setenv("SERVICER_USERNAME", "u")
+    monkeypatch.setenv("SERVICER_PASSWORD", "p")
+    monkeypatch.setenv("GMAIL_IMAP_USER", "me@gmail.com")
+    monkeypatch.setenv("GMAIL_IMAP_APP_PASSWORD", "app-pass")
+    monkeypatch.setenv("MONARCH_COOKIE_SESSION_ID", "abc")
+    monkeypatch.setenv("MONARCH_COOKIE_CSRFTOKEN", "def")
+
+    cfg = load_config(cfg_path)
+    assert cfg.monarch.cookie_string == "session_id=abc; csrftoken=def"
+
+
+def test_build_monarch_cookie_string() -> None:
+    assert _build_monarch_cookie_string(session_id="abc", csrftoken="def") == "session_id=abc; csrftoken=def"
 
 

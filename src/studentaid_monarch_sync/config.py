@@ -140,6 +140,9 @@ def _default_config_from_env() -> dict:
         "monarch": {
             "email": os.getenv("MONARCH_EMAIL", ""),
             "password": os.getenv("MONARCH_PASSWORD", ""),
+            "cookie_string": os.getenv("MONARCH_COOKIE_STRING", ""),
+            "cookie_session_id": os.getenv("MONARCH_COOKIE_SESSION_ID", ""),
+            "cookie_csrftoken": os.getenv("MONARCH_COOKIE_CSRFTOKEN", ""),
             "token": os.getenv("MONARCH_TOKEN", ""),
             "mfa_secret": os.getenv("MONARCH_MFA_SECRET", ""),
             "transfer_category_name": os.getenv("MONARCH_TRANSFER_CATEGORY_NAME", "Transfer"),
@@ -215,10 +218,16 @@ class GmailImapConfig(BaseModel):
 
 
 class MonarchConfig(BaseModel):
-    # If you use "Sign in with Apple", prefer token-based auth.
+    # Preferred Monarch auth now: full browser cookie string copied from DevTools.
+    cookie_string: str = Field(default="", repr=False)
+    # Split vars for users who prefer to paste session_id and csrftoken separately.
+    cookie_session_id: str = Field(default="", repr=False)
+    cookie_csrftoken: str = Field(default="", repr=False)
+
+    # Compatibility token path for installs that still work with token auth.
     token: str = Field(default="", repr=False)
 
-    # Email/password auth (optional if token is set)
+    # Email/password auth for Monarch accounts that still use password login.
     email: str = ""
     password: str = Field(default="", repr=False)
     mfa_secret: str = Field(default="", repr=False)
@@ -243,6 +252,10 @@ class MonarchConfig(BaseModel):
         # Some commands (e.g. `list-loan-groups`) only need portal access.
         #
         # Commands that require Monarch will validate auth explicitly and raise a clear error.
+        has_session = bool((self.cookie_session_id or "").strip())
+        has_csrf = bool((self.cookie_csrftoken or "").strip())
+        if not self.cookie_string and has_session and has_csrf:
+            self.cookie_string = f"session_id={self.cookie_session_id.strip()}; csrftoken={self.cookie_csrftoken.strip()}"
         return self
 
 

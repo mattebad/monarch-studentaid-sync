@@ -10,6 +10,12 @@ from typing import Optional, List, Dict, Any, Tuple, Callable, Awaitable, TypeVa
 
 from monarchmoney import MonarchMoney
 
+try:
+    from monarchmoney import CaptchaRequiredException
+except ImportError:  # pragma: no cover - compatibility with older monarchmoneycommunity builds
+    class CaptchaRequiredException(Exception):
+        pass
+
 from ..util.money import cents_to_money_str
 
 
@@ -50,22 +56,24 @@ class MonarchClient:
         *,
         email: str,
         password: str,
+        cookie_string: str,
         token: str,
         mfa_secret: str,
         session_file: str,
     ) -> None:
         self._email = email
         self._password = password
+        self._cookie_string = cookie_string.strip() if cookie_string else ""
         self._token = token.strip() if token else ""
         self._mfa_secret = mfa_secret or None
         self._session_file = session_file
-        self._mm = MonarchMoney(session_file=session_file, token=self._token or None)
 
         self._accounts_cache: Optional[List[Dict[str, Any]]] = None
         self._account_type_options_cache: Optional[List[Dict[str, Any]]] = None
         self._category_cache: Optional[List[Dict[str, Any]]] = None
         self._transactions_cache: dict[tuple[str, str, str, int, int, str], List[Dict[str, Any]]] = {}
         self._student_loan_type_subtype: Optional[Tuple[str, str]] = None
+        self._reset_client()
 
     async def _call_with_retry(self, op: str, fn: Callable[[], Awaitable[T]]) -> T:
         """
@@ -126,35 +134,89 @@ class MonarchClient:
         for k in doomed:
             self._transactions_cache.pop(k, None)
 
+    def _reset_client(self, *, include_token: bool = True) -> None:
+        self._mm = MonarchMoney(session_file=self._session_file, token=self._token if include_token and self._token else None)
+        self._accounts_cache = None
+        self._account_type_options_cache = None
+        self._category_cache = None
+        self._transactions_cache = {}
+        self._student_loan_type_subtype = None
+
     async def login(self) -> None:
         # Ensure the session directory exists (important for commands like list-monarch-accounts).
         session_path = Path(self._session_file)
         session_path.parent.mkdir(parents=True, exist_ok=True)
+        last_exc: Optional[BaseException] = None
 
-        # 1) If we have a saved session token, use it (works with Sign in with Apple).
+        # Start from a clean client so stale auth mode/cookies from a prior attempt do not leak into other paths.
+        self._reset_client()
+
+        # 1) If we have a saved session, use it first.
         if session_path.exists():
             try:
                 self._mm.load_session(str(session_path))
+                await self._mm.get_accounts()
                 return
-            except Exception:
+            except Exception as e:
                 logger.warning("Failed to load saved Monarch session; will re-authenticate.", exc_info=True)
+                last_exc = e
                 try:
                     session_path.unlink()
                 except Exception:
                     logger.debug("Failed to delete invalid Monarch session file.", exc_info=True)
+                self._reset_client()
 
-        # 2) If caller provided a token, use it and persist it.
+        # 2) Browser-cookie bootstrap from Monarch web session.
+        if self._cookie_string:
+            try:
+                await self._mm.login_with_cookies(self._cookie_string, save_session=True, verify=True)
+                return
+            except Exception as e:
+                logger.warning("Monarch cookie auth failed; will try token or password login if configured.", exc_info=True)
+                last_exc = e
+                self._reset_client()
+
+        # 3) Compatibility token path. Keep only for installs that still work with token auth.
         if self._token:
-            self._mm.save_session(str(session_path))
-            return
+            try:
+                await self._mm.get_accounts()
+                self._mm.save_session(str(session_path))
+                return
+            except Exception as e:
+                logger.warning("Monarch token auth failed; will try password login if configured.", exc_info=True)
+                last_exc = e
+                self._reset_client(include_token=False)
 
-        # 3) Fall back to email/password login.
-        await self._mm.login(
-            email=self._email,
-            password=self._password,
-            use_saved_session=True,
-            save_session=True,
-            mfa_secret_key=self._mfa_secret,
+        # 4) Fall back to email/password login.
+        if self._email and self._password:
+            try:
+                await self._mm.login(
+                    email=self._email,
+                    password=self._password,
+                    use_saved_session=False,
+                    save_session=True,
+                    mfa_secret_key=self._mfa_secret,
+                )
+                return
+            except CaptchaRequiredException as e:
+                raise RuntimeError(
+                    "Monarch login blocked by CAPTCHA. Use bootstrap-monarch-auth in a browser or export "
+                    "MONARCH_COOKIE_STRING / split cookie vars from an authenticated Monarch request, delete stale "
+                    "data/monarch_session.pickle, then rerun."
+                ) from e
+            except Exception as e:
+                logger.warning("Monarch email/password auth failed.", exc_info=True)
+                last_exc = e
+
+        if last_exc is not None:
+            raise RuntimeError(
+                "Monarch auth failed. Delete stale data/monarch_session.pickle, rerun bootstrap-monarch-auth, or "
+                "refresh MONARCH_COOKIE_STRING / split cookie vars from an authenticated browser session, then rerun."
+            ) from last_exc
+
+        raise RuntimeError(
+            "Missing Monarch auth. Use bootstrap-monarch-auth once, set MONARCH_COOKIE_STRING or split cookie vars, "
+            "or set MONARCH_EMAIL + MONARCH_PASSWORD in your .env. An existing data/monarch_session.pickle also works."
         )
 
     async def list_accounts(self) -> List[Dict[str, Any]]:

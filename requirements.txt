@@ -8,8 +8,8 @@ requests==2.32.3
 
 # Monarch API client (unofficial).
 # NOTE: The original `hammem/monarchmoney` project is unmaintained and uses the old Monarch domain.
-# This maintained fork includes fixes for the domain change to `api.monarch.com`.
-monarchmoneycommunity==1.1.0
+# This maintained fork includes fixes for the domain change to `api.monarch.com` and cookie-based auth.
+monarchmoneycommunity==1.4.0
 
 # Tests (fast, no secrets)
 pytest==8.3.4

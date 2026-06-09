@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "studentaid-monarch-sync"
 version = "0.1.0"
 description = "Sync StudentAid servicer loan balances + posted payments into Monarch Money"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 
 [tool.setuptools.packages.find]
 where = ["src"]
