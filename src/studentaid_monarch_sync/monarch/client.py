@@ -404,10 +404,15 @@ class MonarchClient:
         date_window_days: int = 0,
         max_pages: int = 5,
         search: str = "",
+        require_merchant_match: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """
-        Look for an existing transaction matching date + amount + merchant.
+        Look for an existing transaction matching date + amount (+ optionally merchant).
         Returns the matching transaction dict if found.
+
+        Merchant matching is off by default: account_id + date + amount is specific enough
+        for loan payment accounts, and manually-entered transactions may use a different
+        merchant name than the sync-created ones.
 
         We page through results because Monarch may return more than our per-request limit for
         a date range (especially if a user has many transactions on a given day).
@@ -438,9 +443,10 @@ class MonarchClient:
                     continue
                 if _dollars_to_cents(t.get("amount")) != want_amount_cents:
                     continue
-                got_merchant = _txn_merchant_name(t).strip().lower()
-                if got_merchant != want_merchant:
-                    continue
+                if require_merchant_match:
+                    got_merchant = _txn_merchant_name(t).strip().lower()
+                    if got_merchant != want_merchant:
+                        continue
                 return t
 
             # If we didn't fill the page, there are no more results.
