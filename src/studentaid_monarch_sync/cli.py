@@ -311,12 +311,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                 portal = ServicerPortalClient(
                     base_url=cfg.servicer.base_url,
                     creds=PortalCredentials(
-                username=cfg.servicer.username,
-                password=cfg.servicer.password,
-                account_number=cfg.servicer.account_number,
-                date_of_birth=cfg.servicer.date_of_birth,
-                ssn=cfg.servicer.ssn,
-            ),
+                        username=cfg.servicer.username,
+                        password=cfg.servicer.password,
+                        account_number=cfg.servicer.account_number,
+                        date_of_birth=cfg.servicer.date_of_birth,
+                        ssn=cfg.servicer.ssn,
+                    ),
                 )
 
                 mfa_provider = lambda: poll_gmail_imap_for_code(cfg.gmail_imap, print_code=args.print_mfa_code)
@@ -746,6 +746,7 @@ async def _log_dry_run_with_monarch(cfg, state: StateStore, loan_snapshots, paym
             search=(alloc.payment_reference or "").strip()
             if getattr(cfg.monarch, "duplicate_guard_use_reference", False)
             else "",
+            loose_match=getattr(cfg.monarch, "duplicate_guard_loose_match", False),
         )
         if dup:
             would_skip_dup += 1
@@ -1185,6 +1186,7 @@ async def _apply_monarch_updates(
             search=(alloc.payment_reference or "").strip()
             if getattr(cfg.monarch, "duplicate_guard_use_reference", False)
             else "",
+            loose_match=getattr(cfg.monarch, "duplicate_guard_loose_match", False),
         )
         if dup:
             logger.info(

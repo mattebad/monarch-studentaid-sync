@@ -1539,6 +1539,10 @@ class ServicerPortalClient:
         Only runs for the edfinancial provider. On an unrecognized device the portal asks for
         SSN (or Account Number) AND Date of Birth instead of emailing a code. If account_number/ssn
         + date_of_birth are configured, fill and submit so the run can proceed unattended.
+
+        Fallback: when an account number is configured we try it first; if that does not clear the
+        challenge and an SSN is configured, we automatically retry with the SSN. If nothing clears it
+        (or the required values are missing) we fail fast with an actionable error.
         """
         if self.provider != "edfinancial":
             return
@@ -1574,8 +1578,62 @@ class ServicerPortalClient:
         month, day, year = self._parse_dob(dob)
         if not (month and day and year):
             raise RuntimeError(f"Could not parse SERVICER_DOB={dob!r}; expected MM/DD/YYYY.")
+        self._complete_device_challenge_with_fallback(
+            page, acct=acct, ssn=ssn, month=month, day=day, year=year, debug_dir=debug_dir
+        )
+
+    def _complete_device_challenge_with_fallback(
+        self, page: Page, *, acct: str, ssn: str, month: str, day: str, year: str, debug_dir: str
+    ) -> None:
+        """
+        Try account number + DOB first (if configured), then fall back to SSN + DOB if the challenge
+        remains. Raise an actionable error if neither path clears it.
+        """
+        tried_account = False
+        tried_ssn = False
+        if acct:
+            tried_account = True
+            if self._edf_submit_device_challenge(
+                page, mode="account", acct=acct, ssn=ssn, month=month, day=day, year=year, debug_dir=debug_dir
+            ):
+                logger.info("New-device identity challenge cleared using account number.")
+                return
+            logger.info("Account-number device verification did not clear the challenge; trying SSN if configured.")
+        if ssn:
+            tried_ssn = True
+            if self._edf_submit_device_challenge(
+                page, mode="ssn", acct=acct, ssn=ssn, month=month, day=day, year=year, debug_dir=debug_dir
+            ):
+                logger.info("New-device identity challenge cleared using SSN.")
+                return
+            logger.info("SSN device verification did not clear the challenge.")
+        self._save_debug(page, debug_dir=debug_dir, name_prefix="device_verify_failure")
+        if tried_account and tried_ssn:
+            raise RuntimeError(
+                "New-device verification failed with both account number and SSN. Verify SERVICER_ACCOUNT_NUMBER, "
+                "SERVICER_SSN, and SERVICER_DOB are correct, or re-run with --headful --manual-mfa."
+            )
+        if tried_account:
+            raise RuntimeError(
+                "New-device verification with the account number failed and no SERVICER_SSN is configured to fall "
+                "back to. Set SERVICER_SSN (and verify SERVICER_DOB), or re-run with --headful --manual-mfa."
+            )
+        raise RuntimeError(
+            "New-device verification with SSN failed. Verify SERVICER_SSN and SERVICER_DOB are correct, or re-run "
+            "with --headful --manual-mfa."
+        )
+
+    def _edf_submit_device_challenge(
+        self, page: Page, *, mode: str, acct: str, ssn: str, month: str, day: str, year: str, debug_dir: str
+    ) -> bool:
+        """
+        Fill and submit the device-verification form using ``mode`` ("account" or "ssn"), then report
+        whether the challenge cleared (i.e. the detection form is no longer visible). An exception while
+        filling/submitting is treated as "not cleared" so the caller can fall back to the other credential.
+        """
+        sel = self.selectors
         try:
-            if acct:
+            if mode == "account":
                 self._type_into(page, sel.device_verify_account_input, acct)
             else:
                 for selector, part in zip(sel.device_verify_ssn_inputs, (ssn[0:3], ssn[3:5], ssn[5:9])):
@@ -1583,14 +1641,24 @@ class ServicerPortalClient:
             self._type_into(page, sel.device_verify_dob_month, month)
             self._type_into(page, sel.device_verify_dob_day, day)
             self._type_into(page, sel.device_verify_dob_year, year)
-            self._step(page, debug_dir=debug_dir, name="device_verify_filled")
+            self._step(page, debug_dir=debug_dir, name=f"device_verify_filled_{mode}")
             page.locator(sel.device_verify_submit).first.click()
             self._wait_for_settle(page, timeout_ms=30_000)
-            self._step(page, debug_dir=debug_dir, name="device_verify_submitted")
-            logger.info("Submitted new-device identity challenge.")
+            self._step(page, debug_dir=debug_dir, name=f"device_verify_submitted_{mode}")
+            logger.info("Submitted new-device identity challenge via %s.", mode)
         except Exception:
-            self._save_debug(page, debug_dir=debug_dir, name_prefix="device_verify_failure")
-            raise
+            logger.warning("Device verification attempt via %s raised; treating as not cleared.", mode, exc_info=True)
+            self._save_debug(page, debug_dir=debug_dir, name_prefix=f"device_verify_{mode}_error")
+            return False
+        # The challenge cleared if its detection form is no longer visible.
+        try:
+            page.locator(sel.device_verify_detect).first.wait_for(state="hidden", timeout=8000)
+            return True
+        except Exception:
+            try:
+                return not page.locator(sel.device_verify_detect).first.is_visible()
+            except Exception:
+                return True
     # ------------------------------------------------------------------
     # EdFinancial-specific parsing (server-rendered myaccount.* app)
     # ------------------------------------------------------------------

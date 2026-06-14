@@ -342,6 +342,7 @@ See **Quick start → Runtime A: Docker (recommended)** for the Unraid schedulin
 - **Portal asks for SSN / Account Number + Date of Birth instead of emailing a code**
   - On an unrecognized device, some servicers (e.g. EdFinancial) show a step-up identity challenge (Account Number *or* SSN, plus Date of Birth) instead of sending an email code. The email poller then times out waiting for a code that never arrives.
   - Set `SERVICER_ACCOUNT_NUMBER` (preferred, so you do not store an SSN) or `SERVICER_SSN`, plus `SERVICER_DOB` (`MM/DD/YYYY`). The automation fills and submits the challenge, then saves the trusted session so the portal usually stops challenging (~90 days).
+  - If both are set, the account number is tried first; if it does not clear the challenge, the automation automatically retries with the SSN. If neither clears it (or only the account number is configured and it fails), the run stops with an actionable error telling you what to set.
   - Alternatively, run `sync --headful --manual-mfa` once and complete the page by hand to establish the trusted session.
 
 <a id="403-access-denied"></a>
@@ -358,6 +359,7 @@ See **Quick start → Runtime A: Docker (recommended)** for the Unraid schedulin
 - `monarch.payment_merchant_name`: merchant name to use when creating payment transactions, and the value used by the **duplicate guard**.
   - If your existing loan-account payments show up as **US Department of Education**, set this to that (recommended).
 - `monarch.duplicate_guard_use_reference` / `MONARCH_DUPLICATE_GUARD_USE_REFERENCE` (optional): when the portal provides a payment confirmation/reference, use it as a Monarch search term during duplicate detection to reduce false positives for same-day identical payments.
+- `monarch.duplicate_guard_loose_match` / `MONARCH_DUPLICATE_GUARD_LOOSE_MATCH` (optional, default off): the duplicate guard is **strict** by default (matches on **date + amount + merchant**). Enable this only if you intentionally rename payment merchants in Monarch — in loose mode the guard still tries a strict match first and falls back to **date + amount** (ignoring merchant) only if strict misses. A loose fallback is clearly logged whenever it skips creating a transaction.
 
 <a id="monarch-token"></a>
 ### Getting `MONARCH_TOKEN` (token-based auth for SSO)

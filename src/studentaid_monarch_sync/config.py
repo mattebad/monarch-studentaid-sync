@@ -154,6 +154,9 @@ def _default_config_from_env() -> dict:
             # Optional: refine the Monarch-side duplicate guard by using the portal's payment reference
             # (confirmation number) as a search term. Off by default because it relies on Monarch search semantics.
             "duplicate_guard_use_reference": _env_bool("MONARCH_DUPLICATE_GUARD_USE_REFERENCE", default=False),
+            # Optional: opt-in loose duplicate matching (strict date+amount+merchant by default; loose falls
+            # back to date+amount only when strict misses). See MonarchConfig.duplicate_guard_loose_match.
+            "duplicate_guard_loose_match": _env_bool("MONARCH_DUPLICATE_GUARD_LOOSE_MATCH", default=False),
         },
         "state": {
             "db_path": os.getenv("STATE_DB_PATH", "data/state.db"),
@@ -245,6 +248,10 @@ class MonarchConfig(BaseModel):
     # Optional: when the portal provides a confirmation/reference for a payment, use it as a search term
     # for Monarch duplicate detection to reduce false positives when two payments share date+amount+merchant.
     duplicate_guard_use_reference: bool = False
+    # Optional: opt-in loose duplicate matching. Default is strict (date + amount + merchant). When enabled,
+    # the guard tries a strict match first and only falls back to date + amount (ignoring merchant) if strict
+    # misses — useful when manually-entered transactions use a different merchant name than sync-created ones.
+    duplicate_guard_loose_match: bool = False
 
     @model_validator(mode="after")
     def _validate_auth(self) -> "MonarchConfig":

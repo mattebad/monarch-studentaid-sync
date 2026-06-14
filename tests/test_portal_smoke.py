@@ -129,3 +129,11 @@ def test_cri_preflight_and_dry_run() -> None:
 @pytest.mark.portal
 def test_nelnet_preflight_and_dry_run() -> None:
     _run_preflight_and_dry_run("nelnet")
+
+
+@pytest.mark.portal
+def test_edfinancial_preflight_and_dry_run() -> None:
+    # EdFinancial verifies new devices with account number/SSN + DOB instead of an emailed code, so a
+    # local run typically sets PORTAL_SMOKE_SKIP_IMAP=1 and provides SERVICER_ACCOUNT_NUMBER (and/or
+    # SERVICER_SSN) + SERVICER_DOB in the env file. Skipped unless those credentials are configured.
+    _run_preflight_and_dry_run("edfinancial")
