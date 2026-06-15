@@ -212,6 +212,16 @@ class ServicerConfig(BaseModel):
         if not parsed.scheme or not parsed.netloc:
             raise ValueError(f"servicer.base_url must be a full URL like 'https://{provider}.studentaid.gov'")
 
+        # Validate optional SSN: if provided, must be exactly 9 digits (ignoring separators
+        # like dashes/spaces). Fail fast at config load instead of mid-run on the portal so a
+        # fat-fingered extra/missing digit doesn't waste a full automation run.
+        ssn_digits = re.sub(r"\D", "", self.ssn or "")
+        if self.ssn and len(ssn_digits) != 9:
+            raise ValueError(
+                "servicer.ssn must be a 9-digit Social Security Number "
+                "(dashes/spaces allowed, e.g. '123-45-6789')"
+            )
+
         self.provider = provider
         self.base_url = base_url
         return self

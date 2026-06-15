@@ -4,7 +4,11 @@ from pathlib import Path
 
 import pytest
 
-from studentaid_monarch_sync.config import _derive_provider_from_base_url, load_config
+from studentaid_monarch_sync.config import (
+    ServicerConfig,
+    _derive_provider_from_base_url,
+    load_config,
+)
 
 
 def _write(tmp_path: Path, name: str, text: str) -> Path:
@@ -83,6 +87,23 @@ monarch:
     )
     with pytest.raises(Exception):
         _ = load_config(cfg_path)
+
+
+def _servicer(ssn: str) -> ServicerConfig:
+    return ServicerConfig(provider="edfinancial", username="u", password="p", ssn=ssn)
+
+
+@pytest.mark.parametrize("ssn", ["123456789", "123-45-6789", "123 45 6789", ""])
+def test_servicer_ssn_accepts_valid_and_empty(ssn: str) -> None:
+    # 9 digits (with or without separators) pass; empty is allowed since SSN is optional.
+    cfg = _servicer(ssn)
+    assert cfg.ssn == ssn
+
+
+@pytest.mark.parametrize("ssn", ["12345678", "1234567890", "123-45-678", "12-345-67890"])
+def test_servicer_ssn_rejects_wrong_length(ssn: str) -> None:
+    with pytest.raises(ValueError, match="ssn"):
+        _servicer(ssn)
 
 
 def test_invalid_provider_slug_rejected(tmp_path: Path) -> None:
