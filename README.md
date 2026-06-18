@@ -23,9 +23,12 @@ At a high level, each scheduled run:
 
 #### Prereqs (set these up once) ✅
 - **Monarch auth** (choose one):
-  - **Email/password**: set `MONARCH_EMAIL` + `MONARCH_PASSWORD`
-    - If you currently use **Google** / “**Continue with Google**” to access Monarch, you’ll need to **set a password** to use the API client (Monarch → **Settings → Security**).
-  - **Sign in with Apple / Google (token-based)**: set `MONARCH_TOKEN` (recommended for SSO). If you need help extracting it, see [Getting `MONARCH_TOKEN`](#monarch-token).
+  - **Cookie auth (preferred)**: run `bootstrap-monarch-auth` once to save `data/monarch_session.pickle` from a browser login, or set `MONARCH_COOKIE_STRING` to `session_id=...; csrftoken=...`.
+    - If you prefer split env vars, set `MONARCH_COOKIE_SESSION_ID` + `MONARCH_COOKIE_CSRFTOKEN`.
+  - **Email/password option**: set `MONARCH_EMAIL` + `MONARCH_PASSWORD` if your Monarch account uses password login.
+    - If you currently use **Google** / “**Continue with Google**” to access Monarch, you’ll need to **set a password** in Monarch → **Settings → Security** first.
+- The first successful Monarch login writes `data/monarch_session.pickle`; later runs reuse that saved session until it expires.
+  - To test the saved-session path by itself, temporarily clear `MONARCH_COOKIE_STRING` and `MONARCH_COOKIE_SESSION_ID` / `MONARCH_COOKIE_CSRFTOKEN` from `.env`, then run `preflight` or `sync --dry-run --dry-run-check-monarch`.
 - **Gmail IMAP for MFA**
   - You’ll need **IMAP enabled** + **2‑Step Verification** + a **Google App Password**.
   - If you want the step-by-step Gmail label/filter setup (recommended), see [Gmail IMAP setup](#gmail-imap-setup) 🏷️
@@ -38,7 +41,7 @@ Copy `env.example` → `.env` and fill in values (Monarch + Gmail IMAP + your lo
 Required:
 - `SERVICER_PROVIDER`, `SERVICER_USERNAME`, `SERVICER_PASSWORD`
 - `LOAN_GROUPS` (comma-separated: `AA,AB,...` or `1-01,1-02,...`)
-- Monarch auth (`MONARCH_TOKEN` or `MONARCH_EMAIL` + `MONARCH_PASSWORD`)
+- Monarch auth (`MONARCH_COOKIE_STRING`, split cookie vars, or `MONARCH_EMAIL` + `MONARCH_PASSWORD`)
 - Gmail IMAP (`GMAIL_IMAP_USER` + `GMAIL_IMAP_APP_PASSWORD`)
 
 Advanced (optional):
@@ -101,13 +104,19 @@ mkdir data
 docker compose run --rm --build studentaid-monarch-sync preflight
 ```
 
-4. Dry-run:
+4. Dry-run only:
 
 ```bash
 docker compose run --rm studentaid-monarch-sync sync --dry-run --payments-since 2025-01-01
 ```
 
-5. Run for real (writes to Monarch):
+5. Dry-run + read-only Monarch duplicate check:
+
+```bash
+docker compose run --rm studentaid-monarch-sync sync --dry-run --dry-run-check-monarch --payments-since 2025-01-01
+```
+
+6. Run for real (writes to Monarch):
 
 ```bash
 docker compose run --rm studentaid-monarch-sync sync --payments-since 2025-01-01
@@ -167,6 +176,8 @@ cd /path/to/repo && bash ./scripts/docker_sync.sh run --payments-since 2025-01-0
 Keep `./data` persistent so sessions and the SQLite idempotency DB survive restarts.
 
 #### Runtime B: Python (desktop/server) 🐍
+Requires Python 3.10+ now, because the updated Monarch dependency needs it.
+
 **Install**
 
 - **Windows**:
@@ -203,6 +214,12 @@ python3 -m venv .venv
 
 ```bash
 .venv\Scripts\python -m studentaid_monarch_sync sync --dry-run --headful
+```
+
+**Dry-run + read-only Monarch check**
+
+```bash
+.venv\Scripts\python -m studentaid_monarch_sync sync --dry-run --dry-run-check-monarch --headful --payments-since 2025-01-01 --max-payments 1
 ```
 
 **Run for real (writes to Monarch) ✅**
@@ -330,9 +347,10 @@ See **Quick start → Runtime A: Docker (recommended)** for the Unraid schedulin
   - Even if SQLite is lost, the Monarch-side duplicate guard (**date + amount + merchant**) prevents duplicate payment transactions.
 
 ### Troubleshooting (common friction)
-- **Monarch preflight failed / token expired**
-  - Re-login / refresh `MONARCH_TOKEN`.
-  - If a stale session is stuck, delete `data/monarch_session.pickle` and retry preflight.
+- **Monarch auth failed / 401**
+  - Re-copy `MONARCH_COOKIE_STRING` from an authenticated Monarch browser request.
+  - If `data/monarch_session.pickle` is stale, delete it and retry preflight.
+  - If you want a quick read-only check before a real run, use `sync --dry-run --dry-run-check-monarch`.
 - **MFA email not found**
   - Confirm Gmail IMAP is enabled and `GMAIL_IMAP_FOLDER` matches the label name.
   - Set broad hints: `GMAIL_IMAP_SENDER_HINT=studentaid.gov` and `GMAIL_IMAP_SUBJECT_HINT=code`.
@@ -361,15 +379,25 @@ See **Quick start → Runtime A: Docker (recommended)** for the Unraid schedulin
 - `monarch.duplicate_guard_use_reference` / `MONARCH_DUPLICATE_GUARD_USE_REFERENCE` (optional): when the portal provides a payment confirmation/reference, use it as a Monarch search term during duplicate detection to reduce false positives for same-day identical payments.
 - `monarch.duplicate_guard_loose_match` / `MONARCH_DUPLICATE_GUARD_LOOSE_MATCH` (optional, default off): the duplicate guard is **strict** by default (matches on **date + amount + merchant**). Enable this only if you intentionally rename payment merchants in Monarch — in loose mode the guard still tries a strict match first and falls back to **date + amount** (ignoring merchant) only if strict misses. A loose fallback is clearly logged whenever it skips creating a transaction.
 
-<a id="monarch-token"></a>
-### Getting `MONARCH_TOKEN` (token-based auth for SSO)
-This works well for **Sign in with Apple** and **Continue with Google** flows, where password-based API login can be confusing.
+<a id="monarch-cookie-string"></a>
+### Getting `MONARCH_COOKIE_STRING` (browser-cookie auth)
+This is the most reliable way to bootstrap Monarch auth now.
 
-1. Log into Monarch in your browser normally (Apple/Google/etc).
+If you do not want to copy cookie values at all, run:
+
+```bash
+.venv/bin/python -m studentaid_monarch_sync bootstrap-monarch-auth
+```
+
+It opens Monarch in a browser, waits for you to log in once, then saves a reusable `data/monarch_session.pickle`.
+
+1. Log into Monarch in your browser normally.
 2. Open DevTools → **Network** tab.
-3. Click any request to Monarch’s API (often `graphql`).
-4. In **Request Headers**, copy the value after `Authorization: Token ...`.
-5. Put that into `.env` as `MONARCH_TOKEN=...` (keep it secret).
+3. Click any authenticated request to Monarch’s API (often `graphql`).
+4. In **Request Headers**, copy the cookie value after `Cookie:`. Do **not** include the `Cookie:` label itself.
+5. Minimum needed cookies are `session_id` and `csrftoken`. Extra cookies like `cf_clearance`, `__cf_bm`, `ajs_*`, and `osano_*` are not used by this project.
+6. Put the copied cookie string into `.env` as `MONARCH_COOKIE_STRING=session_id=...; csrftoken=...` (keep it secret).
+   - Or split them: `MONARCH_COOKIE_SESSION_ID=...` + `MONARCH_COOKIE_CSRFTOKEN=...`
 
 ### CLI flags (reference)
 Run `-h` at any time to see the full help:

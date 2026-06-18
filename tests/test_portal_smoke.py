@@ -53,6 +53,19 @@ def _build_env(provider: str, *, base_env: dict[str, str]) -> dict[str, str]:
     return env
 
 
+def _has_monarch_auth(env: dict[str, str]) -> bool:
+    if env.get("MONARCH_COOKIE_STRING"):
+        return True
+    if env.get("MONARCH_COOKIE_SESSION_ID") and env.get("MONARCH_COOKIE_CSRFTOKEN"):
+        return True
+    if env.get("MONARCH_TOKEN"):
+        return True
+    if env.get("MONARCH_EMAIL") and env.get("MONARCH_PASSWORD"):
+        return True
+    session_file = Path(env.get("MONARCH_SESSION_FILE", str(ROOT / "data/monarch_session.pickle")))
+    return session_file.exists()
+
+
 def _skip_or_fail(reason: str) -> None:
     # Portal smoke tests require real credentials and should not fail local unit test runs by default.
     # To force failures locally (e.g., in a dedicated integration run), set REQUIRE_PORTAL_TESTS=1.
@@ -71,8 +84,10 @@ def _skip_if_missing(provider: str, *, env: dict[str, str], env_file: Optional[P
     if not env.get("LOAN_GROUPS"):
         _skip_or_fail(f"Missing LOAN_GROUPS for {provider}.")
 
-    if not env.get("MONARCH_TOKEN") and not (env.get("MONARCH_EMAIL") and env.get("MONARCH_PASSWORD")):
-        _skip_or_fail("Missing Monarch auth (MONARCH_TOKEN or MONARCH_EMAIL + MONARCH_PASSWORD).")
+    if not _has_monarch_auth(env):
+        _skip_or_fail(
+            "Missing Monarch auth (MONARCH_COOKIE_STRING, split cookie vars, MONARCH_EMAIL + MONARCH_PASSWORD, or saved session)."
+        )
 
     if os.getenv("PORTAL_SMOKE_SKIP_IMAP") != "1":
         if not env.get("GMAIL_IMAP_USER") or not env.get("GMAIL_IMAP_APP_PASSWORD"):

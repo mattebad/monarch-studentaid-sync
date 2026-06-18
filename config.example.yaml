@@ -23,9 +23,11 @@ gmail_imap:
   code_regex: "\\b(\\d{6})\\b"
 
 monarch:
+  cookie_string: "${MONARCH_COOKIE_STRING}"
+  cookie_session_id: "${MONARCH_COOKIE_SESSION_ID}"
+  cookie_csrftoken: "${MONARCH_COOKIE_CSRFTOKEN}"
   email: "${MONARCH_EMAIL}"
   password: "${MONARCH_PASSWORD}"
-  token: "${MONARCH_TOKEN}"
   mfa_secret: "${MONARCH_MFA_SECRET}"
   transfer_category_name: "Transfer"
   # Merchant name to use for payment transactions (also used by dupe-check: date + amount + merchant)

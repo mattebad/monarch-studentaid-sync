@@ -5,6 +5,8 @@ import sys
 import types
 from typing import Any, Dict, List
 
+import pytest
+
 
 def _import_monarch_client_with_fake_dep(monkeypatch):
     """
@@ -14,7 +16,17 @@ def _import_monarch_client_with_fake_dep(monkeypatch):
     dedupe-on-create-error) without requiring the real Monarch client dependency.
     """
 
+    class FakeCaptchaRequiredException(Exception):
+        pass
+
     class FakeMonarchMoney:
+        load_session_error: Exception | None = None
+        login_error: Exception | None = None
+        login_with_cookies_error: Exception | None = None
+        get_accounts_error: Exception | None = None
+        instances: List["FakeMonarchMoney"] = []
+        CaptchaRequiredException = FakeCaptchaRequiredException
+
         def __init__(self, session_file: str, token: str | None = None) -> None:
             self.session_file = session_file
             self.token = token
@@ -23,19 +35,48 @@ def _import_monarch_client_with_fake_dep(monkeypatch):
             self.calls_get_transactions = 0
             self.fail_create_after_append = False
             self.fail_get_transactions_times = 0
+            self.loaded_session_paths: List[str] = []
+            self.saved_session_paths: List[str] = []
+            self.login_calls: List[Dict[str, Any]] = []
+            self.login_with_cookies_calls: List[Dict[str, Any]] = []
+            self.calls_get_accounts = 0
+            self.__class__.instances.append(self)
 
         # Session helpers used by MonarchClient.login()
         def load_session(self, _path: str) -> None:
+            self.loaded_session_paths.append(_path)
+            if self.__class__.load_session_error is not None:
+                raise self.__class__.load_session_error
             return None
 
         def save_session(self, _path: str) -> None:
+            self.saved_session_paths.append(_path)
             return None
 
         # Methods called by MonarchClient
         async def login(self, **_kwargs: Any) -> None:
+            self.login_calls.append(dict(_kwargs))
+            if self.__class__.login_error is not None:
+                raise self.__class__.login_error
+            if _kwargs.get("save_session", True):
+                self.save_session(self.session_file)
+            return None
+
+        async def login_with_cookies(self, cookie_string: str, **_kwargs: Any) -> None:
+            call = {"cookie_string": cookie_string, **_kwargs}
+            self.login_with_cookies_calls.append(call)
+            if self.__class__.login_with_cookies_error is not None:
+                raise self.__class__.login_with_cookies_error
+            if _kwargs.get("verify", True):
+                await self.get_accounts()
+            if _kwargs.get("save_session", True):
+                self.save_session(self.session_file)
             return None
 
         async def get_accounts(self) -> Dict[str, Any]:
+            self.calls_get_accounts += 1
+            if self.__class__.get_accounts_error is not None:
+                raise self.__class__.get_accounts_error
             return {"accounts": [{"id": "acct1", "displayBalance": 0, "displayName": "Loan-AA", "isManual": True}]}
 
         async def get_transaction_categories(self) -> Dict[str, Any]:
@@ -93,6 +134,7 @@ def _import_monarch_client_with_fake_dep(monkeypatch):
 
     fake_mod = types.ModuleType("monarchmoney")
     fake_mod.MonarchMoney = FakeMonarchMoney
+    fake_mod.CaptchaRequiredException = FakeCaptchaRequiredException
     monkeypatch.setitem(sys.modules, "monarchmoney", fake_mod)
 
     # Ensure the module imports fresh with our stub.
@@ -108,6 +150,7 @@ def test_create_payment_transaction_invalidates_transactions_cache(monkeypatch, 
     mc = MonarchClient(
         email="",
         password="",
+        cookie_string="",
         token="token",
         mfa_secret="",
         session_file=str(tmp_path / "monarch_session.pickle"),
@@ -158,6 +201,7 @@ def test_create_payment_transaction_recovers_on_timeout_by_duplicate_guard(monke
     mc = MonarchClient(
         email="",
         password="",
+        cookie_string="",
         token="token",
         mfa_secret="",
         session_file=str(tmp_path / "monarch_session.pickle"),
@@ -186,6 +230,7 @@ def test_find_duplicate_transaction_paginates(monkeypatch, tmp_path) -> None:
     mc = MonarchClient(
         email="",
         password="",
+        cookie_string="",
         token="token",
         mfa_secret="",
         session_file=str(tmp_path / "monarch_session.pickle"),
@@ -233,6 +278,7 @@ def test_list_transactions_retries_transient_failure(monkeypatch, tmp_path) -> N
     mc = MonarchClient(
         email="",
         password="",
+        cookie_string="",
         token="token",
         mfa_secret="",
         session_file=str(tmp_path / "monarch_session.pickle"),
@@ -259,6 +305,7 @@ def test_find_duplicate_transaction_respects_search(monkeypatch, tmp_path) -> No
     mc = MonarchClient(
         email="",
         password="",
+        cookie_string="",
         token="token",
         mfa_secret="",
         session_file=str(tmp_path / "monarch_session.pickle"),
@@ -298,5 +345,125 @@ def test_find_duplicate_transaction_respects_search(monkeypatch, tmp_path) -> No
     )
     assert dup is not None
     assert dup.get("id") == "t2"
+
+
+def test_login_prefers_saved_session_over_cookie_bootstrap(monkeypatch, tmp_path) -> None:
+    MonarchClient, FakeMonarchMoney = _import_monarch_client_with_fake_dep(monkeypatch)
+    session_file = tmp_path / "monarch_session.pickle"
+    session_file.write_text("placeholder", encoding="utf-8")
+
+    mc = MonarchClient(
+        email="",
+        password="",
+        cookie_string="session_id=cookie; csrftoken=csrf",
+        token="token",
+        mfa_secret="",
+        session_file=str(session_file),
+    )
+
+    asyncio.run(mc.login())
+
+    assert mc._mm.loaded_session_paths == [str(session_file)]
+    assert mc._mm.login_with_cookies_calls == []
+    assert mc._mm.login_calls == []
+    assert mc._mm.calls_get_accounts == 1
+
+
+def test_login_bootstraps_from_cookie_string(monkeypatch, tmp_path) -> None:
+    MonarchClient, FakeMonarchMoney = _import_monarch_client_with_fake_dep(monkeypatch)
+    session_file = tmp_path / "monarch_session.pickle"
+
+    mc = MonarchClient(
+        email="",
+        password="",
+        cookie_string="session_id=cookie; csrftoken=csrf",
+        token="token",
+        mfa_secret="",
+        session_file=str(session_file),
+    )
+
+    asyncio.run(mc.login())
+
+    assert mc._mm.loaded_session_paths == []
+    assert mc._mm.login_with_cookies_calls == [
+        {
+            "cookie_string": "session_id=cookie; csrftoken=csrf",
+            "save_session": True,
+            "verify": True,
+        }
+    ]
+    assert mc._mm.login_calls == []
+    assert mc._mm.calls_get_accounts == 1
+    assert mc._mm.saved_session_paths == [str(session_file)]
+
+
+def test_login_falls_back_from_stale_session_to_cookie_string(monkeypatch, tmp_path) -> None:
+    MonarchClient, FakeMonarchMoney = _import_monarch_client_with_fake_dep(monkeypatch)
+    FakeMonarchMoney.load_session_error = RuntimeError("stale session")
+    session_file = tmp_path / "monarch_session.pickle"
+    session_file.write_text("bad pickle", encoding="utf-8")
+
+    mc = MonarchClient(
+        email="",
+        password="",
+        cookie_string="session_id=cookie; csrftoken=csrf",
+        token="token",
+        mfa_secret="",
+        session_file=str(session_file),
+    )
+
+    asyncio.run(mc.login())
+
+    assert FakeMonarchMoney.instances[1].loaded_session_paths == [str(session_file)]
+    assert mc._mm.login_with_cookies_calls == [
+        {
+            "cookie_string": "session_id=cookie; csrftoken=csrf",
+            "save_session": True,
+            "verify": True,
+        }
+    ]
+    assert mc._mm.login_calls == []
+    assert mc._mm.calls_get_accounts == 1
+    assert not session_file.exists()
+
+
+def test_login_uses_token_compatibility_path(monkeypatch, tmp_path) -> None:
+    MonarchClient, FakeMonarchMoney = _import_monarch_client_with_fake_dep(monkeypatch)
+    session_file = tmp_path / "monarch_session.pickle"
+
+    mc = MonarchClient(
+        email="",
+        password="",
+        cookie_string="",
+        token="legacy-token",
+        mfa_secret="",
+        session_file=str(session_file),
+    )
+
+    asyncio.run(mc.login())
+
+    assert mc._mm.loaded_session_paths == []
+    assert mc._mm.login_with_cookies_calls == []
+    assert mc._mm.login_calls == []
+    assert mc._mm.calls_get_accounts == 1
+    assert mc._mm.saved_session_paths == [str(session_file)]
+
+
+def test_login_password_captcha_guides_cookie_bootstrap(monkeypatch, tmp_path) -> None:
+    MonarchClient, FakeMonarchMoney = _import_monarch_client_with_fake_dep(monkeypatch)
+    FakeMonarchMoney.login_error = FakeMonarchMoney.CaptchaRequiredException("CAPTCHA_REQUIRED")
+    session_file = tmp_path / "monarch_session.pickle"
+
+    mc = MonarchClient(
+        email="me@example.com",
+        password="secret",
+        cookie_string="",
+        token="",
+        mfa_secret="",
+        session_file=str(session_file),
+    )
+
+    with pytest.raises(RuntimeError, match="MONARCH_COOKIE_STRING"):
+        asyncio.run(mc.login())
 
 
