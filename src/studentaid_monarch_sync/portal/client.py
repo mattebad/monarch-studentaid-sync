@@ -40,6 +40,11 @@ class PortalAccessDeniedError(RuntimeError):
 class PortalCredentials:
     username: str
     password: str
+    # Used to answer a new-device identity challenge (account number/SSN + DOB) shown by
+    # some servicers (e.g. EdFinancial) on an unrecognized device instead of an email code.
+    account_number: str = ""
+    date_of_birth: str = ""  # MM/DD/YYYY (also accepts MM-DD-YYYY or YYYY-MM-DD)
+    ssn: str = ""
 
 
 class ServicerPortalClient:
@@ -61,6 +66,9 @@ class ServicerPortalClient:
         parsed = urlparse(self.base_url)
         self._canonical_host = (parsed.netloc or "").strip().lower()
         self._dark_host = f"dark.{self._canonical_host}" if self._canonical_host else ""
+        # Provider slug derived from host (e.g. "edfinancial" from edfinancial.studentaid.gov).
+        # Used to gate provider-specific behavior so other servicers are unaffected.
+        self.provider = self._canonical_host.split(".")[0] if self._canonical_host else ""
 
         # Step-by-step debug (screenshots) — configured per `extract()` call.
         self._step_log_enabled: bool = False
@@ -499,6 +507,8 @@ class ServicerPortalClient:
 
                         # Navigate to loan details and parse "Group:" headers.
                         self._wait_for_post_login_ready(page, debug_dir=debug_dir, timeout_ms=90_000)
+                        if self.provider == "edfinancial":
+                            return self._edf_discover_loan_groups(page, debug_dir=debug_dir)
                         self._goto_section(page, self.selectors.nav_my_loans_text, debug_dir=debug_dir)
 
                         # Some portals render multiple "My Loans" targets (nav, dashboard cards, footer).
@@ -886,7 +896,15 @@ class ServicerPortalClient:
 
         page.wait_for_timeout(1500)
 
-        if self._looks_like_mfa(page):
+        # EdFinancial: on an unrecognized device the portal shows an identity challenge
+        # (account number/SSN + DOB) before/instead of an email code. Handle it first.
+        self._maybe_complete_device_verification(page, debug_dir=debug_dir, manual_mfa=manual_mfa)
+
+        # Passing that challenge can land us on the authenticated dashboard, whose numeric
+        # inputs (e.g. "Custom Pay") can look like a code field. Only treat the page as MFA
+        # when not already logged in. Gated to edfinancial so other providers are unchanged.
+        already_logged_in = self.provider == "edfinancial" and self._looks_logged_in(page)
+        if not already_logged_in and self._looks_like_mfa(page):
             if mfa_method != "email":
                 raise RuntimeError(f"Only email MFA is supported by this automation (got: {mfa_method})")
             self._step(page, debug_dir=debug_dir, name="mfa_detected")
@@ -1029,6 +1047,15 @@ class ServicerPortalClient:
                     return True
             except Exception:
                 continue
+
+        # EdFinancial Account Summary signals (gated so other providers are unaffected).
+        if self.provider == "edfinancial":
+            for txt in ("Total Current Balance", "Total Payment Due", "$0 Balance Loans"):
+                try:
+                    if page.get_by_text(txt, exact=False).count() > 0:
+                        return True
+                except Exception:
+                    continue
 
         # Authenticated main navigation items (stable in HTML snapshots).
         try:
@@ -1469,6 +1496,398 @@ class ServicerPortalClient:
                 return True
         return False
 
+    def _type_into(self, page: Page, selector: str, value: str, *, timeout_ms: int = 8000) -> None:
+        """Click + type one keystroke at a time (keystroke-masked fields need real key events)."""
+        loc = page.locator(selector).first
+        loc.wait_for(state="visible", timeout=timeout_ms)
+        try:
+            loc.click()
+        except Exception:
+            pass
+        try:
+            loc.fill("")
+        except Exception:
+            pass
+        try:
+            loc.press_sequentially(value, delay=70)
+        except Exception:
+            loc.type(value, delay=70)
+        try:
+            loc.blur()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _parse_dob(value: str) -> tuple:
+        """Parse a DOB string into (MM, DD, YYYY). Accepts MM/DD/YYYY, MM-DD-YYYY, YYYY-MM-DD."""
+        groups = [g for g in re.split(r"[^0-9]+", (value or "").strip()) if g]
+        if len(groups) != 3:
+            return ("", "", "")
+        a, b, c = groups
+        if len(a) == 4:
+            year, month, day = a, b, c
+        else:
+            month, day, year = a, b, c
+        if len(year) == 2:
+            year = ("19" if int(year) > 30 else "20") + year
+        return (month.zfill(2), day.zfill(2), year.zfill(4))
+
+    def _maybe_complete_device_verification(self, page: Page, *, debug_dir: str, manual_mfa: bool = False) -> None:
+        """
+        Handle EdFinancial's "we don't recognize this device" identity challenge.
+
+        Only runs for the edfinancial provider. On an unrecognized device the portal asks for
+        SSN (or Account Number) AND Date of Birth instead of emailing a code. If account_number/ssn
+        + date_of_birth are configured, fill and submit so the run can proceed unattended.
+
+        Fallback: when an account number is configured we try it first; if that does not clear the
+        challenge and an SSN is configured, we automatically retry with the SSN. If nothing clears it
+        (or the required values are missing) we fail fast with an actionable error.
+        """
+        if self.provider != "edfinancial":
+            return
+        sel = self.selectors
+        try:
+            page.locator(sel.device_verify_detect).first.wait_for(state="visible", timeout=8000)
+        except Exception:
+            return
+        self._step(page, debug_dir=debug_dir, name="device_verify_detected")
+        logger.info("Detected new-device identity challenge (account number/SSN + DOB).")
+        acct = (self.creds.account_number or "").strip()
+        ssn = re.sub(r"\D", "", self.creds.ssn or "")
+        dob = (self.creds.date_of_birth or "").strip()
+        if not dob or not (acct or ssn):
+            if manual_mfa:
+                logger.info("Manual mode: complete device verification (account number/SSN + DOB) in the browser.")
+                deadline = time.time() + 180
+                while time.time() < deadline:
+                    try:
+                        if not page.locator(sel.device_verify_detect).first.is_visible():
+                            return
+                    except Exception:
+                        return
+                    page.wait_for_timeout(500)
+                self._save_debug(page, debug_dir=debug_dir, name_prefix="device_verify_manual_timeout")
+                raise TimeoutError("Timed out waiting for manual device verification.")
+            self._save_debug(page, debug_dir=debug_dir, name_prefix="device_verify_unconfigured")
+            raise RuntimeError(
+                "Portal requires new-device verification (account number/SSN + date of birth), but none are "
+                "configured. Set SERVICER_ACCOUNT_NUMBER (or SERVICER_SSN) and SERVICER_DOB, or re-run with "
+                "--headful --manual-mfa to complete it by hand."
+            )
+        month, day, year = self._parse_dob(dob)
+        if not (month and day and year):
+            raise RuntimeError(f"Could not parse SERVICER_DOB={dob!r}; expected MM/DD/YYYY.")
+        self._complete_device_challenge_with_fallback(
+            page, acct=acct, ssn=ssn, month=month, day=day, year=year, debug_dir=debug_dir
+        )
+
+    def _complete_device_challenge_with_fallback(
+        self, page: Page, *, acct: str, ssn: str, month: str, day: str, year: str, debug_dir: str
+    ) -> None:
+        """
+        Try account number + DOB first (if configured), then fall back to SSN + DOB if the challenge
+        remains. Raise an actionable error if neither path clears it.
+        """
+        tried_account = False
+        tried_ssn = False
+        if acct:
+            tried_account = True
+            if self._edf_submit_device_challenge(
+                page, mode="account", acct=acct, ssn=ssn, month=month, day=day, year=year, debug_dir=debug_dir
+            ):
+                logger.info("New-device identity challenge cleared using account number.")
+                return
+            logger.info("Account-number device verification did not clear the challenge; trying SSN if configured.")
+        if ssn:
+            tried_ssn = True
+            if self._edf_submit_device_challenge(
+                page, mode="ssn", acct=acct, ssn=ssn, month=month, day=day, year=year, debug_dir=debug_dir
+            ):
+                logger.info("New-device identity challenge cleared using SSN.")
+                return
+            logger.info("SSN device verification did not clear the challenge.")
+        self._save_debug(page, debug_dir=debug_dir, name_prefix="device_verify_failure")
+        if tried_account and tried_ssn:
+            raise RuntimeError(
+                "New-device verification failed with both account number and SSN. Verify SERVICER_ACCOUNT_NUMBER, "
+                "SERVICER_SSN, and SERVICER_DOB are correct, or re-run with --headful --manual-mfa."
+            )
+        if tried_account:
+            raise RuntimeError(
+                "New-device verification with the account number failed and no SERVICER_SSN is configured to fall "
+                "back to. Set SERVICER_SSN (and verify SERVICER_DOB), or re-run with --headful --manual-mfa."
+            )
+        raise RuntimeError(
+            "New-device verification with SSN failed. Verify SERVICER_SSN and SERVICER_DOB are correct, or re-run "
+            "with --headful --manual-mfa."
+        )
+
+    def _edf_submit_device_challenge(
+        self, page: Page, *, mode: str, acct: str, ssn: str, month: str, day: str, year: str, debug_dir: str
+    ) -> bool:
+        """
+        Fill and submit the device-verification form using ``mode`` ("account" or "ssn"), then report
+        whether the challenge cleared (i.e. the detection form is no longer visible). An exception while
+        filling/submitting is treated as "not cleared" so the caller can fall back to the other credential.
+        """
+        sel = self.selectors
+        try:
+            if mode == "account":
+                self._type_into(page, sel.device_verify_account_input, acct)
+            else:
+                for selector, part in zip(sel.device_verify_ssn_inputs, (ssn[0:3], ssn[3:5], ssn[5:9])):
+                    self._type_into(page, selector, part)
+            self._type_into(page, sel.device_verify_dob_month, month)
+            self._type_into(page, sel.device_verify_dob_day, day)
+            self._type_into(page, sel.device_verify_dob_year, year)
+            self._step(page, debug_dir=debug_dir, name=f"device_verify_filled_{mode}")
+            page.locator(sel.device_verify_submit).first.click()
+            self._wait_for_settle(page, timeout_ms=30_000)
+            self._step(page, debug_dir=debug_dir, name=f"device_verify_submitted_{mode}")
+            logger.info("Submitted new-device identity challenge via %s.", mode)
+        except Exception:
+            logger.warning("Device verification attempt via %s raised; treating as not cleared.", mode, exc_info=True)
+            self._save_debug(page, debug_dir=debug_dir, name_prefix=f"device_verify_{mode}_error")
+            return False
+        # The challenge cleared if its detection form is no longer visible.
+        try:
+            page.locator(sel.device_verify_detect).first.wait_for(state="hidden", timeout=8000)
+            return True
+        except Exception:
+            try:
+                return not page.locator(sel.device_verify_detect).first.is_visible()
+            except Exception:
+                return True
+    # ------------------------------------------------------------------
+    # EdFinancial-specific parsing (server-rendered myaccount.* app)
+    # ------------------------------------------------------------------
+
+    def _edf_app_url(self, path: str) -> str:
+        host = self._canonical_host or "edfinancial.studentaid.gov"
+        return f"https://myaccount.{host}{path}"
+
+    def _edf_goto(self, page: Page, path: str, *, wait_text=None, timeout_ms: int = 45000) -> None:
+        page.goto(self._edf_app_url(path), wait_until="domcontentloaded", timeout=timeout_ms)
+        self._wait_for_settle(page, timeout_ms=timeout_ms)
+        if wait_text:
+            self._wait_for_body_text_contains(page, wait_text, timeout_ms=timeout_ms)
+        else:
+            page.wait_for_timeout(1500)
+
+    def _edf_read_only_table(self, page: Page) -> list:
+        js = (
+            "() => { const t = document.querySelector('table'); if (!t) return []; "
+            "return Array.from(t.querySelectorAll('tr')).map(r => "
+            "Array.from(r.querySelectorAll('th,td')).map(c => (c.innerText||'').trim())); }"
+        )
+        try:
+            return page.evaluate(js) or []
+        except Exception:
+            return []
+
+    @staticmethod
+    def _edf_money_to_cents(s: str) -> int:
+        s = s or ""
+        neg = ("-" in s) or ("(" in s)
+        digits = re.sub(r"[^0-9.]", "", s)
+        if not digits:
+            return 0
+        val = int(round(float(digits) * 100))
+        return -val if neg else val
+
+    @staticmethod
+    def _edf_group_token(loan_name: str) -> str:
+        m = re.match(r"\s*(\d+-\d+)", loan_name or "")
+        return m.group(1) if m else ""
+
+    @staticmethod
+    def _edf_parse_mdy(s: str):
+        m = re.match(r"\s*(\d{1,2})/(\d{1,2})/(\d{4})", s or "")
+        if not m:
+            return None
+        return date(int(m.group(3)), int(m.group(1)), int(m.group(2)))
+
+    @staticmethod
+    def _edf_header_index(header: list, needle: str) -> int:
+        for i, h in enumerate(header):
+            if needle in (h or "").lower():
+                return i
+        return -1
+
+    def _edf_load_loan_rows(self, page: Page, *, debug_dir: str) -> list:
+        self._edf_goto(page, "/Loans/AllLoanDetails", wait_text="Current Balance")
+        self._step(page, debug_dir=debug_dir, name="edf_all_loan_details")
+        matrix = self._edf_read_only_table(page)
+        rows = []
+        if not matrix:
+            return rows
+        header = matrix[0]
+        ci_loan = self._edf_header_index(header, "loan")
+        ci_bal = self._edf_header_index(header, "current balance")
+        ci_rate = self._edf_header_index(header, "interest rate")
+        ci_due = self._edf_header_index(header, "due")
+        for r in matrix[1:]:
+            if not r or all(not c for c in r):
+                continue
+            name = r[ci_loan] if 0 <= ci_loan < len(r) else (r[0] if r else "")
+            token = self._edf_group_token(name)
+            if not token:
+                continue
+            rows.append({
+                "token": token,
+                "label": (name or "").strip(),
+                "balance_cents": self._edf_money_to_cents(r[ci_bal]) if 0 <= ci_bal < len(r) else 0,
+                "rate": (r[ci_rate].strip() if 0 <= ci_rate < len(r) else None),
+                "due": (r[ci_due].strip() if 0 <= ci_due < len(r) else ""),
+            })
+        return rows
+
+    def _edf_discover_loan_groups(self, page: Page, *, debug_dir: str) -> list:
+        rows = self._edf_load_loan_rows(page, debug_dir=debug_dir)
+        out = []
+        seen = set()
+        for r in rows:
+            if r["token"] in seen:
+                continue
+            out.append((r["token"], r["label"]))
+            seen.add(r["token"])
+        if not out:
+            self._save_debug(page, debug_dir=debug_dir, name_prefix="edf_no_loans_found")
+        return out
+
+    def _edf_extract_loans(self, page: Page, *, groups: list, debug_dir: str, allow_empty_loans: bool = False) -> list:
+        rows = self._edf_load_loan_rows(page, debug_dir=debug_dir)
+        by_token = {r["token"]: r for r in rows}
+        want = [g.strip() for g in (groups or []) if (g or "").strip()] or [r["token"] for r in rows]
+        out = []
+        for g in want:
+            r = by_token.get(g)
+            if not r:
+                if allow_empty_loans:
+                    continue
+                raise RuntimeError(f"EdFinancial: loan group {g!r} not found on All Loan Details page.")
+            bal = r["balance_cents"]
+            out.append(LoanSnapshot(
+                group=g,
+                principal_balance_cents=bal,
+                accrued_interest_cents=0,
+                outstanding_balance_cents=bal,
+                due_date=self._edf_parse_mdy(r["due"]),
+                raw_effective_interest_rate=r["rate"],
+            ))
+        return out
+
+    def _edf_select(self, page: Page, name: str, value: str) -> bool:
+        try:
+            page.select_option(f"select#{name}, select[name='{name}']", value, timeout=6000)
+            self._wait_for_settle(page, timeout_ms=20000)
+            page.wait_for_timeout(1000)
+            return True
+        except Exception as e:
+            logger.warning("EdFinancial: could not select %s=%s (%s)", name, value, e)
+            return False
+
+    def _edf_ddl_value_for_group(self, page: Page, group: str):
+        js = (
+            "() => { const s=document.querySelector('select#ddl_Loan, select[name=ddl_Loan]'); "
+            "if(!s) return []; return Array.from(s.options).map(o=>({v:o.value,t:(o.textContent||'').trim()})); }"
+        )
+        try:
+            opts = page.evaluate(js) or []
+        except Exception:
+            opts = []
+        for o in opts:
+            if self._edf_group_token(o.get("t", "")) == group:
+                return o.get("v")
+        return None
+
+    def _edf_parse_history_rows(self, matrix: list) -> list:
+        if not matrix:
+            return []
+        header = matrix[0]
+        h_date = self._edf_header_index(header, "date")
+        h_desc = self._edf_header_index(header, "description")
+        h_pr = self._edf_header_index(header, "principal")
+        h_int = self._edf_header_index(header, "interest")
+        h_tot = self._edf_header_index(header, "total")
+        if h_date < 0:
+            h_date = 0
+        rows = []
+        for r in matrix[1:]:
+            if not r:
+                continue
+            # In the "By Loan" view each row carries a leading expand/disclosure cell, which
+            # shifts every column right by a fixed offset versus the header. Locate the real
+            # (standalone) date cell and map all columns relative to it. Detail/expansion rows
+            # without a standalone date cell are naturally skipped (prevents double-counting).
+            di = -1
+            for i, cell in enumerate(r):
+                if self._edf_parse_mdy(cell) is not None:
+                    di = i
+                    break
+            if di < 0:
+                continue
+            offset = di - h_date
+
+            def at(hi: int, _r=r, _off=offset) -> str:
+                if hi < 0:
+                    return ""
+                j = hi + _off
+                return _r[j] if 0 <= j < len(_r) else ""
+
+            d = self._edf_parse_mdy(at(h_date))
+            if not d:
+                continue
+            desc = at(h_desc).strip().lower()
+            typ = "payment" if "payment" in desc else ("disbursement" if "disburse" in desc else "other")
+            rows.append({
+                "date": d,
+                "type": typ,
+                "principal_cents": self._edf_money_to_cents(at(h_pr)),
+                "interest_cents": self._edf_money_to_cents(at(h_int)),
+                "total_cents": self._edf_money_to_cents(at(h_tot)),
+            })
+        return rows
+
+    def _edf_extract_payment_allocations(self, page: Page, *, groups: list, debug_dir: str, payments_since=None) -> list:
+        want = [g.strip() for g in (groups or []) if (g or "").strip()]
+        self._edf_goto(page, "/AccountHistory/ViewHistory", wait_text="History")
+        self._step(page, debug_dir=debug_dir, name="edf_history_loaded")
+        per_loan = {}
+        date_totals = {}
+        for g in want:
+            # Per-loan, life-of-loan view. Re-assert each iteration in case a postback resets selects.
+            self._edf_select(page, "SelctedHistType", "2")
+            self._edf_select(page, "SelectedDateRange", "5")
+            val = self._edf_ddl_value_for_group(page, g)
+            if val is None:
+                logger.warning("EdFinancial: no loan-history option for group %s; skipping.", g)
+                continue
+            self._edf_select(page, "ddl_Loan", val)
+            rows = self._edf_parse_history_rows(self._edf_read_only_table(page))
+            self._step(page, debug_dir=debug_dir, name=f"edf_history_{g}")
+            per_loan[g] = rows
+            for row in rows:
+                if row["type"] == "payment":
+                    date_totals[row["date"]] = date_totals.get(row["date"], 0) + abs(row["total_cents"])
+        out = []
+        for g, rows in per_loan.items():
+            for row in rows:
+                if row["type"] != "payment":
+                    continue
+                if payments_since and row["date"] < payments_since:
+                    continue
+                out.append(PaymentAllocation(
+                    payment_date=row["date"],
+                    group=g,
+                    total_applied_cents=abs(row["total_cents"]),
+                    principal_applied_cents=abs(row["principal_cents"]),
+                    interest_applied_cents=abs(row["interest_cents"]),
+                    payment_total_cents=date_totals.get(row["date"], abs(row["total_cents"])),
+                ))
+        return out
+
     def _complete_email_mfa(self, page: Page, mfa_code_provider: Callable[[], str], *, debug_dir: str) -> None:
         # Best-effort click Email option if present.
         try:
@@ -1602,6 +2021,11 @@ class ServicerPortalClient:
         self._step(page, debug_dir=debug_dir, name="loans_before_nav_my_loans")
         # Race-condition guard: on slower machines the app may still be on the post-login callback screen.
         self._wait_for_post_login_ready(page, debug_dir=debug_dir, timeout_ms=90_000)
+
+        if self.provider == "edfinancial":
+            return self._edf_extract_loans(
+                page, groups=groups, debug_dir=debug_dir, allow_empty_loans=allow_empty_loans
+            )
 
         # Try nav first (best-effort), but fall back to direct navigation if nav isn't ready/available.
         self._goto_section(page, self.selectors.nav_my_loans_text, debug_dir=debug_dir)
@@ -2038,6 +2462,11 @@ class ServicerPortalClient:
 
         # Best-effort: navigate to payment activity and open the first N payment details.
         self._wait_for_post_login_ready(page, debug_dir=debug_dir, timeout_ms=90_000)
+
+        if self.provider == "edfinancial":
+            return self._edf_extract_payment_allocations(
+                page, groups=groups, debug_dir=debug_dir, payments_since=payments_since
+            )
         self._step(page, debug_dir=debug_dir, name="payments_before_nav_payment_activity")
         self._goto_section(page, self.selectors.nav_payment_activity_text, debug_dir=debug_dir)
         self._step(page, debug_dir=debug_dir, name="payments_after_nav_payment_activity")

@@ -466,10 +466,18 @@ class MonarchClient:
         date_window_days: int = 0,
         max_pages: int = 5,
         search: str = "",
+        loose_match: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """
-        Look for an existing transaction matching date + amount + merchant.
-        Returns the matching transaction dict if found.
+        Look for an existing transaction matching the payment, to avoid creating duplicates.
+
+        Default behavior is **strict**: a transaction must match date + amount + merchant. This is the
+        safe default — it won't treat an unrelated same-day, same-amount transaction as a duplicate.
+
+        When ``loose_match`` is enabled (opt-in via ``MONARCH_DUPLICATE_GUARD_LOOSE_MATCH``), we still try
+        a strict match first and only fall back to a date + amount match (ignoring merchant) if strict
+        misses. This helps when a manually-entered transaction uses a different merchant name than the
+        sync-created ones. When a loose fallback is used, we log a clear line so the skip is auditable.
 
         We page through results because Monarch may return more than our per-request limit for
         a date range (especially if a user has many transactions on a given day).
@@ -484,6 +492,10 @@ class MonarchClient:
         want_amount_cents = int(amount_cents)
         want_merchant = (merchant_name or "").strip().lower()
         search_term = (search or "").strip()
+
+        # In loose mode we keep scanning for a strict (merchant-matching) hit, but remember the first
+        # date+amount-only match as a fallback to use if no strict hit turns up.
+        loose_candidate: Optional[Dict[str, Any]] = None
 
         for page in range(pages):
             txns = await self.list_transactions(
@@ -501,13 +513,24 @@ class MonarchClient:
                 if _dollars_to_cents(t.get("amount")) != want_amount_cents:
                     continue
                 got_merchant = _txn_merchant_name(t).strip().lower()
-                if got_merchant != want_merchant:
-                    continue
-                return t
+                if got_merchant == want_merchant:
+                    return t  # strict match: date + amount + merchant
+                if loose_match and loose_candidate is None:
+                    loose_candidate = t
 
             # If we didn't fill the page, there are no more results.
             if len(txns) < page_size:
                 break
+
+        if loose_candidate is not None:
+            logger.info(
+                "Duplicate guard: no strict date+amount+merchant match; using LOOSE date+amount match "
+                "txn id=%s (merchant differs: got %r want %r)",
+                loose_candidate.get("id") or "",
+                _txn_merchant_name(loose_candidate),
+                merchant_name,
+            )
+            return loose_candidate
 
         return None
 

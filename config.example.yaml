@@ -35,6 +35,9 @@ monarch:
   # Optional: refine the Monarch-side duplicate guard by using the portal's payment confirmation/reference
   # number as a search term. Off by default.
   duplicate_guard_use_reference: "${MONARCH_DUPLICATE_GUARD_USE_REFERENCE}"
+  # Optional: loosen the duplicate guard. Strict by default (date + amount + merchant). When true, the guard
+  # tries strict first and falls back to date + amount only if strict misses (logged when it skips a create).
+  duplicate_guard_loose_match: "${MONARCH_DUPLICATE_GUARD_LOOSE_MATCH}"
   session_file: "data/monarch_session.pickle"
   # Optional: naming scheme for loan-group manual accounts (used for auto-mapping / auto-creation).
   # Placeholders: {provider}, {provider_upper}, {provider_display}, {group}

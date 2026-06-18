@@ -128,6 +128,10 @@ def _default_config_from_env() -> dict:
             "username": os.getenv("SERVICER_USERNAME", ""),
             "password": os.getenv("SERVICER_PASSWORD", ""),
             "mfa_method": os.getenv("SERVICER_MFA_METHOD", "email"),
+            # New-device identity challenge (account number/SSN + DOB) for servicers like EdFinancial.
+            "account_number": os.getenv("SERVICER_ACCOUNT_NUMBER", ""),
+            "date_of_birth": os.getenv("SERVICER_DOB", ""),
+            "ssn": os.getenv("SERVICER_SSN", ""),
         },
         "gmail_imap": {
             "user": os.getenv("GMAIL_IMAP_USER", ""),
@@ -153,6 +157,9 @@ def _default_config_from_env() -> dict:
             # Optional: refine the Monarch-side duplicate guard by using the portal's payment reference
             # (confirmation number) as a search term. Off by default because it relies on Monarch search semantics.
             "duplicate_guard_use_reference": _env_bool("MONARCH_DUPLICATE_GUARD_USE_REFERENCE", default=False),
+            # Optional: opt-in loose duplicate matching (strict date+amount+merchant by default; loose falls
+            # back to date+amount only when strict misses). See MonarchConfig.duplicate_guard_loose_match.
+            "duplicate_guard_loose_match": _env_bool("MONARCH_DUPLICATE_GUARD_LOOSE_MATCH", default=False),
         },
         "state": {
             "db_path": os.getenv("STATE_DB_PATH", "data/state.db"),
@@ -177,6 +184,11 @@ class ServicerConfig(BaseModel):
     username: str
     password: str
     mfa_method: Literal["email"] = "email"
+    # New-device identity challenge (account number/SSN + DOB) for servicers like EdFinancial.
+    # repr-hidden so secrets do not leak into logs.
+    account_number: str = Field(default="", repr=False)
+    date_of_birth: str = Field(default="", repr=False)
+    ssn: str = Field(default="", repr=False)
 
     @model_validator(mode="after")
     def _fill_defaults_and_validate(self) -> "ServicerConfig":
@@ -202,6 +214,16 @@ class ServicerConfig(BaseModel):
         parsed = urlparse(base_url)
         if not parsed.scheme or not parsed.netloc:
             raise ValueError(f"servicer.base_url must be a full URL like 'https://{provider}.studentaid.gov'")
+
+        # Validate optional SSN: if provided, must be exactly 9 digits (ignoring separators
+        # like dashes/spaces). Fail fast at config load instead of mid-run on the portal so a
+        # fat-fingered extra/missing digit doesn't waste a full automation run.
+        ssn_digits = re.sub(r"\D", "", self.ssn or "")
+        if self.ssn and len(ssn_digits) != 9:
+            raise ValueError(
+                "servicer.ssn must be a 9-digit Social Security Number "
+                "(dashes/spaces allowed, e.g. '123-45-6789')"
+            )
 
         self.provider = provider
         self.base_url = base_url
@@ -245,6 +267,10 @@ class MonarchConfig(BaseModel):
     # Optional: when the portal provides a confirmation/reference for a payment, use it as a search term
     # for Monarch duplicate detection to reduce false positives when two payments share date+amount+merchant.
     duplicate_guard_use_reference: bool = False
+    # Optional: opt-in loose duplicate matching. Default is strict (date + amount + merchant). When enabled,
+    # the guard tries a strict match first and only falls back to date + amount (ignoring merchant) if strict
+    # misses — useful when manually-entered transactions use a different merchant name than sync-created ones.
+    duplicate_guard_loose_match: bool = False
 
     @model_validator(mode="after")
     def _validate_auth(self) -> "MonarchConfig":
