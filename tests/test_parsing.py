@@ -292,3 +292,17 @@ def test_looks_like_access_denied_ignores_normal_page_content() -> None:
     c = _client()
     page = _BodyOnlyPage("Welcome back. Payment Activity is ready.")
     assert c._looks_like_access_denied(page) is False
+
+
+def test_browser_compat_uses_linux_profile_for_docker_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("STUDENTAID_MONARCH_RUNTIME", "docker")
+    c = _client()
+    assert "Linux x86_64" in c._browser_compat_user_agent()
+    assert c._browser_compat_platform() == "Linux x86_64"
+
+
+def test_browser_compat_uses_native_profile_when_runtime_forced_native(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("STUDENTAID_MONARCH_RUNTIME", "native")
+    c = _client()
+    assert "Windows NT 10.0" in c._browser_compat_user_agent()
+    assert c._browser_compat_platform() == "Win32"
