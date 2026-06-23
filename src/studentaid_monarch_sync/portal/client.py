@@ -507,7 +507,7 @@ class ServicerPortalClient:
 
                         # Navigate to loan details and parse "Group:" headers.
                         self._wait_for_post_login_ready(page, debug_dir=debug_dir, timeout_ms=90_000)
-                        if self.provider == "edfinancial":
+                        if self.provider in ("edfinancial", "mohela"):
                             return self._edf_discover_loan_groups(page, debug_dir=debug_dir)
                         self._goto_section(page, self.selectors.nav_my_loans_text, debug_dir=debug_dir)
 
@@ -902,8 +902,9 @@ class ServicerPortalClient:
 
         # Passing that challenge can land us on the authenticated dashboard, whose numeric
         # inputs (e.g. "Custom Pay") can look like a code field. Only treat the page as MFA
-        # when not already logged in. Gated to edfinancial so other providers are unchanged.
-        already_logged_in = self.provider == "edfinancial" and self._looks_logged_in(page)
+        # when not already logged in. Gated to providers that use device verification
+        # so other providers are unchanged.
+        already_logged_in = self.provider in ("edfinancial", "mohela") and self._looks_logged_in(page)
         if not already_logged_in and self._looks_like_mfa(page):
             if mfa_method != "email":
                 raise RuntimeError(f"Only email MFA is supported by this automation (got: {mfa_method})")
@@ -1048,8 +1049,9 @@ class ServicerPortalClient:
             except Exception:
                 continue
 
-        # EdFinancial Account Summary signals (gated so other providers are unaffected).
-        if self.provider == "edfinancial":
+        # EdFinancial / MOHELA Account Summary signals (gated so other providers are unaffected).
+        # MOHELA's myaccount.* CALM2 dashboard uses the same headings.
+        if self.provider in ("edfinancial", "mohela"):
             for txt in ("Total Current Balance", "Total Payment Due", "$0 Balance Loans"):
                 try:
                     if page.get_by_text(txt, exact=False).count() > 0:
@@ -1134,17 +1136,18 @@ class ServicerPortalClient:
                 continue
 
             # Try clicking a "Sign in / Log in" entry point if present.
+            url_before_signin = page.url
             self._click_first_by_texts(page, self.selectors.sign_in_entry_texts, ignore_missing=True)
 
-            # Fallback: some entry points aren't exposed as semantic buttons/links.
-            for t in self.selectors.sign_in_entry_texts:
+            # Some portals (e.g. MOHELA) wire login via an onclick JS function
+            # (goLogin()) rather than a navigating <a> or form submit. If the
+            # click above didn't change the URL, call the function directly.
+            if page.url == url_before_signin:
                 try:
-                    cand = page.get_by_text(t, exact=False)
-                    if cand.count() > 0:
-                        cand.first.click()
-                        break
+                    if page.evaluate("typeof goLogin === 'function'"):
+                        page.evaluate("goLogin()")
                 except Exception:
-                    continue
+                    pass
 
             self._wait_for_settle(page)
             self._step(page, debug_dir=debug_dir, name="after_click_signin_entry")
@@ -1544,7 +1547,7 @@ class ServicerPortalClient:
         challenge and an SSN is configured, we automatically retry with the SSN. If nothing clears it
         (or the required values are missing) we fail fast with an actionable error.
         """
-        if self.provider != "edfinancial":
+        if self.provider not in ("edfinancial", "mohela"):
             return
         sel = self.selectors
         try:
@@ -2022,7 +2025,7 @@ class ServicerPortalClient:
         # Race-condition guard: on slower machines the app may still be on the post-login callback screen.
         self._wait_for_post_login_ready(page, debug_dir=debug_dir, timeout_ms=90_000)
 
-        if self.provider == "edfinancial":
+        if self.provider in ("edfinancial", "mohela"):
             return self._edf_extract_loans(
                 page, groups=groups, debug_dir=debug_dir, allow_empty_loans=allow_empty_loans
             )
@@ -2463,7 +2466,7 @@ class ServicerPortalClient:
         # Best-effort: navigate to payment activity and open the first N payment details.
         self._wait_for_post_login_ready(page, debug_dir=debug_dir, timeout_ms=90_000)
 
-        if self.provider == "edfinancial":
+        if self.provider in ("edfinancial", "mohela"):
             return self._edf_extract_payment_allocations(
                 page, groups=groups, debug_dir=debug_dir, payments_since=payments_since
             )
