@@ -1111,6 +1111,10 @@ class ServicerPortalClient:
             # Ensure consent UI isn't intercepting clicks.
             self._dismiss_cookie_banner(page, timeout_ms=3_000)
 
+            # Clear any modal/dialog overlay whose backdrop would swallow the "Log In" click
+            # (servicers pop announcement banners here; e.g. EdFinancial ~July 2026).
+            self._dismiss_blocking_overlay(page)
+
             # Some portals gate the login form behind a federal usage disclaimer ("Accept / Decline").
             # Example: Aidvantage renders the inputs in HTML but hidden until clicking `button#Accept`.
             try:
@@ -1484,6 +1488,62 @@ class ServicerPortalClient:
             )
         except Exception:
             pass
+
+    def _dismiss_blocking_overlay(self, page: Page) -> bool:
+        """
+        Best-effort dismissal of a modal/dialog overlaying the page whose backdrop intercepts clicks.
+
+        The failure class (not one specific banner): a servicer pops an announcement/alert overlay
+        and its backdrop swallows the "Log In" click, so the login form is never reached
+        (LoginFormNotFoundError). EdFinancial began doing this ~July 2026 with Bootstrap modals
+        (`.modal.fade.show`), but the studentaid.gov FSA/USWDS design system also ships `.usa-modal`
+        and generic `role="dialog"` overlays. This is framework-agnostic on purpose: it matches by
+        structure/ARIA, not by text, so new banners on any servicer are handled without code changes.
+        Cookie/disclaimer handlers don't touch these. Returns True if a visible overlay was cleared.
+        """
+        cleared = False
+        try:
+            cleared = bool(
+                page.evaluate(
+                    """
+                    () => {
+                      const isVisible = el => el && (el.offsetParent !== null || getComputedStyle(el).display !== 'none');
+                      // Match modal overlays by structure/ARIA across frameworks (Bootstrap, USWDS, generic).
+                      const overlays = Array.from(document.querySelectorAll(
+                        '.modal.show, .usa-modal, [role="dialog"][aria-modal="true"], [aria-modal="true"]'
+                      )).filter(isVisible);
+                      if (!overlays.length) return false;
+                      const closeSel = [
+                        '[data-bs-dismiss="modal"]', '[data-dismiss="modal"]', '[data-close-modal]',
+                        '.btn-close', '.usa-modal__close', '.close', '[aria-label="Close" i]'
+                      ].join(', ');
+                      for (const o of overlays) {
+                        const close = o.querySelector(closeSel);
+                        if (close) { try { close.click(); } catch (_) {} }
+                        // Force it out of the way in case the click didn't take or there's no close control.
+                        o.classList.remove('show', 'is-visible');
+                        o.style.setProperty('display', 'none', 'important');
+                      }
+                      // Remove backdrops and restore scroll/lock state the frameworks add to <body>.
+                      document.querySelectorAll('.modal-backdrop, .usa-modal-overlay').forEach(b => b.remove());
+                      document.body.classList.remove('modal-open', 'usa-js-modal--active');
+                      document.body.style.removeProperty('overflow');
+                      document.body.style.removeProperty('padding-right');
+                      return true;
+                    }
+                    """
+                )
+            )
+        except Exception:
+            cleared = False
+
+        # Belt: some custom modals only close via their own keydown handler. Cheap and harmless here.
+        try:
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
+
+        return cleared
 
     def _looks_like_mfa(self, page: Page) -> bool:
         # Heuristic: presence of a numeric code input and Email option.
