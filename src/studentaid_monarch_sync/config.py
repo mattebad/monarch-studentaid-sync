@@ -140,6 +140,7 @@ def _default_config_from_env() -> dict:
             "sender_hint": os.getenv("GMAIL_IMAP_SENDER_HINT", ""),
             "subject_hint": os.getenv("GMAIL_IMAP_SUBJECT_HINT", ""),
             "code_regex": os.getenv("GMAIL_IMAP_CODE_REGEX", r"\b(\d{6})\b"),
+            "mfa_timeout_seconds": int(os.getenv("GMAIL_IMAP_TIMEOUT_SECONDS", "300")),
         },
         "monarch": {
             "email": os.getenv("MONARCH_EMAIL", ""),
@@ -237,6 +238,7 @@ class GmailImapConfig(BaseModel):
     sender_hint: str = ""
     subject_hint: str = ""
     code_regex: str = r"\b(\d{6})\b"
+    mfa_timeout_seconds: int = 300
 
 
 class MonarchConfig(BaseModel):

@@ -345,7 +345,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     ),
                 )
 
-                mfa_provider = lambda: poll_gmail_imap_for_code(cfg.gmail_imap, print_code=args.print_mfa_code)
+                mfa_provider = lambda: poll_gmail_imap_for_code(cfg.gmail_imap, timeout_seconds=cfg.gmail_imap.mfa_timeout_seconds, print_code=args.print_mfa_code)
 
                 t_portal = time.time()
                 loan_snapshots, payment_allocations = portal.extract(
@@ -473,7 +473,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 ssn=cfg.servicer.ssn,
             ),
         )
-        mfa_provider = lambda: poll_gmail_imap_for_code(cfg.gmail_imap, print_code=args.print_mfa_code)
+        mfa_provider = lambda: poll_gmail_imap_for_code(cfg.gmail_imap, timeout_seconds=cfg.gmail_imap.mfa_timeout_seconds, print_code=args.print_mfa_code)
 
         groups = portal.discover_loan_groups(
             headless=not args.headful,
@@ -543,7 +543,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             ),
         )
 
-        mfa_provider = lambda: poll_gmail_imap_for_code(cfg.gmail_imap, print_code=args.print_mfa_code)
+        mfa_provider = lambda: poll_gmail_imap_for_code(cfg.gmail_imap, timeout_seconds=cfg.gmail_imap.mfa_timeout_seconds, print_code=args.print_mfa_code)
 
         try:
             out_zip = portal.browse_and_capture(
