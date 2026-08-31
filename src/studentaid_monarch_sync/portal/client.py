@@ -1967,7 +1967,14 @@ class ServicerPortalClient:
             except Exception:
                 continue
 
-        # Wait for code input to be visible.
+        # Give the portal a moment to settle after clicking Send, then check if it has
+        # already advanced past MFA without delivering an email
+        # (EdFinancial sometimes skips email delivery when it recognises the device/credentials).
+        page.wait_for_timeout(3000)
+        if self._looks_logged_in(page) or not self._looks_like_mfa(page):
+            logger.info("Portal advanced past MFA without an email code; skipping IMAP poll.")
+            return
+        # Still on MFA page — wait for code input, then poll IMAP.
         page.wait_for_timeout(1000)
         self._step(page, debug_dir=debug_dir, name="mfa_code_input_visible")
 
